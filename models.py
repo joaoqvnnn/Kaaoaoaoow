@@ -10,13 +10,12 @@ class Base(DeclarativeBase):
 
 class User(Base):
     __tablename__ = "users"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # telegram_id
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     full_name: Mapped[str] = mapped_column(String(255), default="")
     username: Mapped[str] = mapped_column(String(255), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Campos do Módulo 2
     blocked_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     block_reason: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     blocked_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
@@ -44,6 +43,17 @@ class Wallet(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     balance: Mapped[float] = mapped_column(Float, default=0.0)
 
+class WalletTransaction(Base):
+    __tablename__ = "wallet_transactions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    amount: Mapped[float] = mapped_column(Float)
+    type: Mapped[str] = mapped_column(String(50))
+    description: Mapped[str] = mapped_column(String(500), default="")
+    balance_before: Mapped[float] = mapped_column(Float, default=0.0)
+    balance_after: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
 class Payment(Base):
     __tablename__ = "payments"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -54,7 +64,7 @@ class Payment(Base):
 
 class BotSettings(Base):
     __tablename__ = "bot_settings"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)  # sempre 1
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     bot_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     maintenance_mode: Mapped[bool] = mapped_column(Boolean, default=False)
     maintenance_message: Mapped[str] = mapped_column(
