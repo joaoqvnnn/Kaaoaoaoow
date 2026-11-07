@@ -6,13 +6,20 @@ from bot import bot, dp
 from config import WEBHOOK_SECRET, RENDER_EXTERNAL_URL
 from database import engine
 from models import Base
-import admin.dashboard  # registra os handlers do Módulo 1
+from settings_cache import get_settings
+
+# Registra os routers (dashboard + settings)
+import admin.dashboard
+import admin.settings
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Cria tabelas no Postgres se ainda não existirem
+    # Cria tabelas no PostgreSQL
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Garante que a linha única de configurações exista
+    await get_settings(force=True)
 
     # Registra o webhook no Telegram
     if RENDER_EXTERNAL_URL:
@@ -21,7 +28,6 @@ async def lifespan(app: FastAPI):
             drop_pending_updates=True,
         )
     yield
-
     await bot.session.close()
 
 app = FastAPI(lifespan=lifespan)
