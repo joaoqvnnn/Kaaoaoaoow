@@ -52,6 +52,7 @@ def products_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔎 Pesquisar produto", callback_data="prd_search")],
         [InlineKeyboardButton(text="📊 Estatísticas de produtos", callback_data="prd_stats")],
         [InlineKeyboardButton(text="⚙️ Estoque automático", callback_data="prd_stockconfig")],
+        [InlineKeyboardButton(text="🗃️ Estoque completo", callback_data="admin_stock")],  # NOVO
         [InlineKeyboardButton(text="↩️ Voltar", callback_data="admin_refresh")],
     ])
 
