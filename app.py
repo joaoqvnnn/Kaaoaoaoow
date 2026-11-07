@@ -10,7 +10,7 @@ from database import engine, AsyncSessionLocal
 from models import Base, AdminUser
 from settings_cache import get_settings
 
-# Registra todos os 20 módulos
+# Admin (20 módulos)
 import admin.dashboard
 import admin.settings
 import admin.users
@@ -32,6 +32,18 @@ import admin.support
 import admin.security
 import admin.reports
 
+# Membro (11 módulos)
+import member.start
+import member.catalog
+import member.product_detail
+import member.cart
+import member.wallet
+import member.subscriptions
+import member.profile
+import member.ranking
+import member.affiliates
+import member.support
+
 
 async def _ensure_owner():
     if not ADMIN_IDS:
@@ -45,19 +57,26 @@ async def _ensure_owner():
             await s.commit()
 
 
+async def _ensure_customization_defaults():
+    try:
+        from admin.customization import ensure_all_defaults
+        await ensure_all_defaults()
+    except Exception as e:
+        print(f"[startup] customization defaults: {e}")
+
+
 async def _self_ping_loop():
-    """Mantém o serviço acordado no Render Free Tier (evita sleep após 15min)."""
     if not RENDER_EXTERNAL_URL:
         return
-    health_url = f"{RENDER_EXTERNAL_URL}/health"
+    url = f"{RENDER_EXTERNAL_URL}/health"
     await asyncio.sleep(60)
     while True:
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                await client.get(health_url)
+                await client.get(url)
         except Exception:
             pass
-        await asyncio.sleep(600)  # 10 minutos
+        await asyncio.sleep(600)
 
 
 @asynccontextmanager
@@ -67,6 +86,7 @@ async def lifespan(app: FastAPI):
 
     await get_settings(force=True)
     await _ensure_owner()
+    await _ensure_customization_defaults()
 
     if RENDER_EXTERNAL_URL:
         try:
@@ -106,14 +126,18 @@ async def telegram_webhook(request: Request):
 @app.post("/webhook/mercadopago")
 async def mercadopago_webhook(request: Request):
     from admin.recharges import handle_mp_webhook
-    return await handle_mp_webhook(request)
+    try:
+        return await handle_mp_webhook(request)
+    except Exception as e:
+        print(f"[mp_webhook] erro: {e}")
+        return {"ok": False, "error": str(e)[:200]}
 
 
 @app.get("/")
 async def root():
-    return {"service": "bellamy-admin", "status": "online"}
+    return {"service": "bellamy", "status": "online"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "bellamy-admin"}
+    return {"status": "ok", "service": "bellamy"}
