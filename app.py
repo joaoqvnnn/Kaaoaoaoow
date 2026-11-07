@@ -8,20 +8,18 @@ from database import engine
 from models import Base
 from settings_cache import get_settings
 
-# Registra os routers (dashboard + settings)
+# Registra os routers de todos os módulos
 import admin.dashboard
 import admin.settings
+import admin.users
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Cria tabelas no PostgreSQL
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # Garante que a linha única de configurações exista
     await get_settings(force=True)
 
-    # Registra o webhook no Telegram
     if RENDER_EXTERNAL_URL:
         await bot.set_webhook(
             url=f"{RENDER_EXTERNAL_URL}/webhook/{WEBHOOK_SECRET}",
