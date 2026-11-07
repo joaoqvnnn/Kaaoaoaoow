@@ -8,18 +8,16 @@ from database import engine
 from models import Base
 from settings_cache import get_settings
 
-# Registra os routers de todos os módulos
 import admin.dashboard
 import admin.settings
 import admin.users
+import admin.products
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
     await get_settings(force=True)
-
     if RENDER_EXTERNAL_URL:
         await bot.set_webhook(
             url=f"{RENDER_EXTERNAL_URL}/webhook/{WEBHOOK_SECRET}",
