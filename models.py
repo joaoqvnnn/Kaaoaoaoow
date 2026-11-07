@@ -29,6 +29,7 @@ class Product(Base):
     promo_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     category: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     stock: Mapped[int] = mapped_column(Integer, default=0)
+    reserved_stock: Mapped[int] = mapped_column(Integer, default=0)  # NOVO — Módulo 5
     image_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     delivery_info: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     activation_link: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
@@ -38,8 +39,8 @@ class Product(Base):
     featured: Mapped[bool] = mapped_column(Boolean, default=False)
     display_order: Mapped[int] = mapped_column(Integer, default=0)
     sold_count: Mapped[int] = mapped_column(Integer, default=0)
-    min_stock_alert: Mapped[int] = mapped_column(Integer, default=0)  # 0 = usa global
-    max_stock: Mapped[int] = mapped_column(Integer, default=0)        # 0 = sem limite
+    min_stock_alert: Mapped[int] = mapped_column(Integer, default=0)
+    max_stock: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 class StockMovement(Base):
@@ -47,7 +48,7 @@ class StockMovement(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     product_id: Mapped[int] = mapped_column(Integer, index=True)
     admin_id: Mapped[int] = mapped_column(BigInteger)
-    movement_type: Mapped[str] = mapped_column(String(50))  # restock / withdraw
+    movement_type: Mapped[str] = mapped_column(String(50))
     quantity: Mapped[int] = mapped_column(Integer)
     stock_before: Mapped[int] = mapped_column(Integer)
     stock_after: Mapped[int] = mapped_column(Integer)
@@ -116,11 +117,14 @@ class BotSettings(Base):
     points_conversion_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     registration_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     support_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    # Campos do Módulo 4 — estoque automático
     stock_alert_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     stock_low_threshold: Mapped[int] = mapped_column(Integer, default=5)
     allow_out_of_stock_sales: Mapped[bool] = mapped_column(Boolean, default=False)
     notify_restock_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # NOVOS — Módulo 5
+    stock_max_global: Mapped[int] = mapped_column(Integer, default=0)          # 0 = sem limite
+    stock_reserve_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    stock_reserve_minutes: Mapped[int] = mapped_column(Integer, default=30)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
