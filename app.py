@@ -12,6 +12,7 @@ import admin.dashboard
 import admin.settings
 import admin.users
 import admin.products
+import admin.stock
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
