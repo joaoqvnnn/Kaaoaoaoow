@@ -1,7 +1,7 @@
 from aiogram import Router, F
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ForceReply,
+    ForceReply, InputMediaPhoto,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -28,7 +28,7 @@ class BuyStates(StatesGroup):
 
 
 # ============================================================
-# LOCKS E CACHE (anti-duplo + contador de visualização)
+# LOCKS E CACHE
 # ============================================================
 _user_locks: dict[int, asyncio.Lock] = {}
 _viewers: dict[int, dict[int, datetime]] = {}
@@ -46,7 +46,6 @@ def _get_user_lock(user_id: int) -> asyncio.Lock:
 def _register_viewer(product_id: int, user_id: int) -> int:
     now = datetime.utcnow()
     bucket = _viewers.setdefault(product_id, {})
-    # limpa expirados
     for uid, ts in list(bucket.items()):
         if now - ts > _VIEW_TTL:
             del bucket[uid]
@@ -66,6 +65,74 @@ async def _get_balance(user_id: int) -> float:
     async with AsyncSessionLocal() as s:
         w = await s.get(Wallet, user_id)
         return w.balance if w else 0.0
+
+
+# ============================================================
+# HELPER CENTRAL DE ATUALIZAÇÃO (§1 — editar sempre que possível)
+# ============================================================
+async def _update_to_product(
+    target: Message | CallbackQuery,
+    text: str,
+    kb: InlineKeyboardMarkup | None,
+    image_url: str | None,
+):
+    """
+    Atualiza a mensagem atual para a tela de produto respeitando §1:
+    - Texto → texto: edit_text (edição pura)
+    - Foto → foto: edit_media (troca mídia + caption, mesma mensagem)
+    - Texto → foto ou foto → texto: delete + answer (limitação do Telegram)
+    """
+    is_cb = isinstance(target, CallbackQuery)
+    msg = target.message if is_cb else target
+
+    has_photo_now = bool(getattr(msg, "photo", None))
+    has_photo_new = bool(image_url)
+
+    # Caso 1 — texto → texto: edita
+    if not has_photo_now and not has_photo_new:
+        try:
+            await msg.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+        await msg.answer(text, reply_markup=kb)
+        return
+
+    # Caso 2 — foto → foto: troca mídia + legenda
+    if has_photo_now and has_photo_new:
+        try:
+            await msg.edit_media(
+                media=InputMediaPhoto(media=image_url, caption=text),
+                reply_markup=kb,
+            )
+            return
+        except Exception:
+            pass
+        # fallback: recria a mensagem
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await msg.answer_photo(photo=image_url, caption=text, reply_markup=kb)
+        return
+
+    # Caso 3 — texto → foto (Telegram não permite converter)
+    if not has_photo_now and has_photo_new:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await msg.answer_photo(photo=image_url, caption=text, reply_markup=kb)
+        return
+
+    # Caso 4 — foto → texto (Telegram não permite converter)
+    if has_photo_now and not has_photo_new:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await msg.answer(text, reply_markup=kb)
+        return
 
 
 # ============================================================
@@ -171,20 +238,7 @@ async def cb_show_product(cb: CallbackQuery, state: FSMContext):
 
     text, kb, image_url = result
 
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
-
-    if image_url:
-        try:
-            await cb.message.answer_photo(photo=image_url, caption=text, reply_markup=kb)
-            await cb.answer()
-            return
-        except Exception:
-            pass
-
-    await cb.message.answer(text, reply_markup=kb)
+    await _update_to_product(cb, text, kb, image_url)
     await cb.answer()
 
 
@@ -196,7 +250,6 @@ async def _check_buy(product_id: int, user_id: int, quantity: int):
         p = await s.get(Product, product_id)
         w = await s.get(Wallet, user_id)
 
-        # Verificar se o produto usa pool de credenciais
         cred_count = (await s.execute(
             select(func.count(ProductCredential.id))
             .where(ProductCredential.product_id == product_id)
@@ -216,7 +269,6 @@ async def _check_buy(product_id: int, user_id: int, quantity: int):
     if not allow_oos and p.stock < quantity:
         return False, f"Estoque insuficiente (disponível: {p.stock}).", {}
 
-    # Se tem pool de credenciais, exige estoque de credenciais também
     if has_pool and cred_count < quantity:
         return False, f"Sem unidades disponíveis para entrega imediata (disponível: {cred_count}).", {}
 
@@ -269,7 +321,7 @@ async def _show_insufficient_balance(
 
 
 async def show_purchase_summary(target, product_id: int, quantity: int, data: dict):
-    """Público: usado também por member/wallet.py ao retornar da recarga."""
+    """Resumo/confirmação. Usado também pelo wallet.py após retornar da recarga."""
     p = data["product"]
     balance = data["balance"]
     total = data["total"]
@@ -484,9 +536,6 @@ async def msg_quantity_input(m: Message, state: FSMContext):
 
     if not ok:
         if err == "insufficient_balance":
-            temp_state = m.bot.__dict__.setdefault("_temp_state", None)  # não usado
-            # Chamamos com um FSMContext fake — usamos o próprio state limpo
-            # Criamos manualmente a tela de saldo insuficiente
             await _show_insufficient_balance_nostate(
                 m, result["missing"], pid, qty,
             )
@@ -500,7 +549,6 @@ async def msg_quantity_input(m: Message, state: FSMContext):
 async def _show_insufficient_balance_nostate(
     target, missing: float, product_id: int, quantity: int,
 ):
-    """Variante sem FSM (chamada de message handler após state.clear())."""
     text = (
         f"⚠️ SALDO INSUFICIENTE\n\n"
         f"Não foi possível continuar com sua compra.\n\n"
@@ -598,7 +646,7 @@ async def cb_cancel_purchase(cb: CallbackQuery, state: FSMContext):
 
 
 # ============================================================
-# CONFIRMAR COMPRA — PROTEÇÃO ANTI-DUPLO + FOR UPDATE
+# CONFIRMAR COMPRA — anti-duplo
 # ============================================================
 @router.callback_query(F.data.startswith("pd_confirm_"))
 async def cb_confirm_purchase(cb: CallbackQuery):
@@ -659,7 +707,6 @@ async def cb_confirm_purchase(cb: CallbackQuery):
 # ============================================================
 async def _execute_purchase(user_id: int, product_id: int, quantity: int) -> dict:
     async with AsyncSessionLocal() as s:
-        # SELECT FOR UPDATE garante atomicidade em cliques simultâneos
         product_row = (await s.execute(
             select(Product).where(Product.id == product_id).with_for_update()
         )).scalar_one_or_none()
@@ -676,7 +723,6 @@ async def _execute_purchase(user_id: int, product_id: int, quantity: int) -> dic
         if not allow_oos and product_row.stock < quantity:
             return {"ok": False, "error": f"Estoque insuficiente (disponível: {product_row.stock})."}
 
-        # Pool de credenciais
         has_pool = (await s.execute(
             select(func.count(ProductCredential.id))
             .where(ProductCredential.product_id == product_id)
@@ -732,8 +778,6 @@ async def _execute_purchase(user_id: int, product_id: int, quantity: int) -> dic
         await s.flush()
         order_id = order.id
 
-        # Cria OrderDelivery por unidade
-        deliveries = []
         for i in range(quantity):
             cred = credentials[i] if i < len(credentials) else None
             if cred:
@@ -794,7 +838,6 @@ async def _execute_purchase(user_id: int, product_id: int, quantity: int) -> dic
             "has_individual_credentials": has_pool,
         }
 
-    # Efeitos colaterais
     try:
         from admin.channels import publish_purchase_announcement
         await publish_purchase_announcement(order_id)
@@ -851,7 +894,6 @@ async def _show_delivery(target, result: dict):
     has_individual = result.get("has_individual_credentials", False)
 
     if has_individual:
-        # Busca deliveries individuais
         async with AsyncSessionLocal() as s:
             deliveries = (await s.execute(
                 select(OrderDelivery)
