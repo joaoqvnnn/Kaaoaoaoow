@@ -26,6 +26,7 @@ class PS(StatesGroup):
     new_delivery = State()
     new_activation = State()
     new_image = State()
+    new_validity = State()
     edit_field = State()
     restock_amount = State()
     withdraw_amount = State()
@@ -187,9 +188,34 @@ async def new_activation(m: Message, state: FSMContext):
 
 @router.message(PS.new_image)
 async def new_image(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id): return
+    if not is_admin(m.from_user.id):
+        return
     text = m.text.strip()
     image_url = None if text.lower() == SKIP else text
+    await state.update_data(image_url=image_url)
+    await state.set_state(PS.new_validity)
+    await m.answer(
+        "⏳ (10/10) Dias de validade da assinatura (ou /pular = sem validade):\n\n"
+        "Ex.: <code>30</code> = assinatura expira em 30 dias após a compra."
+    )
+
+
+@router.message(PS.new_validity)
+async def new_validity(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    text = m.text.strip()
+    if text.lower() == SKIP:
+        validity_days = 0
+    else:
+        try:
+            validity_days = int(text)
+            if validity_days < 0:
+                raise ValueError
+        except ValueError:
+            await m.answer("❌ Envie um número inteiro ≥ 0, ou /pular.")
+            return
+
     data = await state.get_data()
     await state.clear()
 
@@ -203,7 +229,8 @@ async def new_image(m: Message, state: FSMContext):
             stock=data["stock"],
             delivery_info=data.get("delivery_info"),
             activation_link=data.get("activation_link"),
-            image_url=image_url,
+            image_url=data.get("image_url"),
+            validity_days=validity_days,
             is_active=True,
         )
         s.add(p)
@@ -211,7 +238,9 @@ async def new_image(m: Message, state: FSMContext):
         await s.refresh(p)
         pid = p.id
 
-    await log_admin(m.from_user.id, "product_create", {"product_id": pid, "name": data["name"]})
+    await log_admin(m.from_user.id, "product_create", {
+        "product_id": pid, "name": data["name"], "validity_days": validity_days,
+    })
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Cadastrar outro", callback_data="prd_new")],
@@ -219,7 +248,12 @@ async def new_image(m: Message, state: FSMContext):
         [InlineKeyboardButton(text="📦 Listar produtos", callback_data="prd_list_0")],
         [InlineKeyboardButton(text="↩️ Menu de produtos", callback_data="admin_products")],
     ])
-    await m.answer(f"✅ Produto <b>{data['name']}</b> criado com sucesso!\nID: #{pid}", reply_markup=kb)
+    await m.answer(
+        f"✅ Produto <b>{data['name']}</b> criado com sucesso!\n"
+        f"ID: #{pid}\n"
+        f"⏳ Validade: {validity_days if validity_days > 0 else 'sem validade'}",
+        reply_markup=kb,
+    )
 
 
 # ============ LISTAGEM ============
@@ -295,6 +329,7 @@ async def render_product(pid: int) -> tuple[str, InlineKeyboardMarkup]:
         f"🛒 Vendidos: {p.sold_count}\n"
         f"⚙️ Status: {status}{feat}\n"
         f"🔢 Min/Max por compra: {p.min_per_purchase}/{p.max_per_purchase}\n"
+        f"⏳ Validade: {(str(p.validity_days) + ' dias') if p.validity_days else 'sem validade'}\n"
         f"📅 Cadastro: {p.created_at.strftime('%d/%m/%Y %H:%M')}"
     )
 
@@ -311,6 +346,7 @@ async def render_product(pid: int) -> tuple[str, InlineKeyboardMarkup]:
          InlineKeyboardButton(text="🔢 Max compra", callback_data=f"prd_ef_max_{pid}")],
         [InlineKeyboardButton(text="📊 Ordem", callback_data=f"prd_ef_ord_{pid}"),
          InlineKeyboardButton(text="⚠️ Alerta estoque", callback_data=f"prd_ef_alert_{pid}")],
+        [InlineKeyboardButton(text="⏳ Validade", callback_data=f"prd_ef_validity_{pid}")],
         [InlineKeyboardButton(text="📥 Abastecer", callback_data=f"prd_restock_{pid}"),
          InlineKeyboardButton(text="📤 Retirar", callback_data=f"prd_withdraw_{pid}")],
         [InlineKeyboardButton(text="🔐 Credenciais de acesso", callback_data=f"prd_creds_{pid}")],
@@ -351,6 +387,7 @@ FIELD_PROMPTS = {
     "max":   ("Informe a NOVA quantidade máxima por compra:", "max_per_purchase", int),
     "ord":   ("Informe a NOVA ordem de exibição (0 = primeiro):", "display_order", int),
     "alert": ("Informe o NOVO limite de alerta de estoque (0 = usa global):", "min_stock_alert", int),
+    "validity": ("Informe os dias de validade (0 = sem validade):", "validity_days", int),
 }
 
 
