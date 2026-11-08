@@ -223,6 +223,14 @@ class BotSettings(Base):
     quantity_suggestions: Mapped[Optional[list]] = mapped_column(
         JSON, default=lambda: [1, 2, 3, 5, 10]
     )
+    # Saudação configurável (§1)
+    greeting_morning_start: Mapped[int] = mapped_column(Integer, default=5)
+    greeting_morning_end: Mapped[int] = mapped_column(Integer, default=12)
+    greeting_afternoon_start: Mapped[int] = mapped_column(Integer, default=12)
+    greeting_afternoon_end: Mapped[int] = mapped_column(Integer, default=18)
+    greeting_morning_text: Mapped[str] = mapped_column(String(50), default="Bom dia")
+    greeting_afternoon_text: Mapped[str] = mapped_column(String(50), default="Boa tarde")
+    greeting_night_text: Mapped[str] = mapped_column(String(50), default="Boa noite")
 
 
 class AdminLog(Base):
