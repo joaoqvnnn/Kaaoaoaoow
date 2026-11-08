@@ -1,4 +1,5 @@
 import asyncio
+import traceback
 import httpx
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
@@ -63,6 +64,7 @@ async def _ensure_customization_defaults():
         await ensure_all_defaults()
     except Exception as e:
         print(f"[startup] customization defaults: {e}")
+        traceback.print_exc()
 
 
 async def _self_ping_loop():
@@ -81,32 +83,57 @@ async def _self_ping_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    await get_settings(force=True)
-    await _ensure_owner()
-    await _ensure_customization_defaults()
-
-    if RENDER_EXTERNAL_URL:
-        try:
-            await bot.set_webhook(
-                url=f"{RENDER_EXTERNAL_URL}/webhook/{WEBHOOK_SECRET}",
-                drop_pending_updates=True,
-            )
-        except Exception as e:
-            print(f"[webhook] erro: {e}")
-
-    ping_task = asyncio.create_task(_self_ping_loop())
-
-    yield
-
-    ping_task.cancel()
     try:
-        await ping_task
-    except asyncio.CancelledError:
-        pass
-    await bot.session.close()
+        print("[startup] criar tabelas")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        print("[startup] tabelas OK")
+
+        print("[startup] carregar settings")
+        await get_settings(force=True)
+        print("[startup] settings OK")
+
+        print("[startup] garantir owner")
+        await _ensure_owner()
+        print("[startup] owner OK")
+
+        print("[startup] garantir defaults de customização")
+        await _ensure_customization_defaults()
+        print("[startup] customization OK")
+
+        if RENDER_EXTERNAL_URL:
+            print(f"[startup] registrar webhook em {RENDER_EXTERNAL_URL}")
+            try:
+                await bot.set_webhook(
+                    url=f"{RENDER_EXTERNAL_URL}/webhook/{WEBHOOK_SECRET}",
+                    drop_pending_updates=True,
+                )
+                print("[startup] webhook OK")
+            except Exception as e:
+                print(f"[webhook] erro: {e}")
+                traceback.print_exc()
+
+        ping_task = asyncio.create_task(_self_ping_loop())
+        print("[startup] TUDO PRONTO")
+
+        yield
+
+        ping_task.cancel()
+        try:
+            await ping_task
+        except asyncio.CancelledError:
+            pass
+        await bot.session.close()
+    except Exception as e:
+        print("=" * 60)
+        print("ERRO FATAL NO STARTUP")
+        print("=" * 60)
+        print(f"Tipo: {type(e).__name__}")
+        print(f"Mensagem: {e}")
+        print("-" * 60)
+        traceback.print_exc()
+        print("=" * 60)
+        raise
 
 
 app = FastAPI(lifespan=lifespan)
