@@ -63,6 +63,9 @@ class Order(Base):
     cancelled_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # NOVAS COLUNAS ADICIONADAS AQUI
+    processing_lock: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class Wallet(Base):
@@ -211,6 +214,10 @@ class BotSettings(Base):
     # Meta
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
+    )
+    # NOVO CAMPO ADICIONADO AQUI
+    quantity_suggestions: Mapped[Optional[list]] = mapped_column(
+        JSON, default=lambda: [1, 2, 3, 5, 10]
     )
 
 
@@ -675,3 +682,45 @@ class ReportExport(Base):
     rows_count: Mapped[int] = mapped_column(Integer, default=0)
     file_size: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+# ============================================================
+# ADIÇÕES DO PACOTE A — Credenciais individuais e proteções
+# ============================================================
+
+class ProductCredential(Base):
+    """
+    Pool de credenciais individuais por produto.
+    Cada linha = 1 acesso único (e-mail/senha/extra) entregue a 1 unidade vendida.
+    Quando o produto tem pelo menos 1 credencial cadastrada, o sistema exige
+    pool suficiente para vender (não usa delivery_info).
+    """
+    __tablename__ = "product_credentials"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_id: Mapped[int] = mapped_column(Integer, index=True)
+    email: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    password: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    extra_data: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    is_sold: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    sold_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    order_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class OrderDelivery(Base):
+    """
+    Uma entrega individual por unidade vendida.
+    Vinculada a Order + Product + ProductCredential (quando existir).
+    """
+    __tablename__ = "order_deliveries"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(Integer, index=True)
+    product_id: Mapped[int] = mapped_column(Integer)
+    credential_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    password: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    extra_data: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    delivered_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # revoked quando o pedido é cancelado/reembolsado
+    is_revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
