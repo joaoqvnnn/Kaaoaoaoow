@@ -1463,34 +1463,37 @@ async def approve_referral(referral_id: int, admin_id: int) -> bool:
     return True
 
 
-async def convert_points_to_balance(user_id: int, points: int) -> tuple[bool, str]:
+async def convert_points_to_balance(
+    user_id: int, points: int,
+) -> tuple[bool, str, int | None]:
     """
     Converte pontos em saldo na carteira do afiliado.
-    Retorna (sucesso, mensagem).
+    Retorna (sucesso, mensagem, id_operacao).
+    id_operacao é o ID da AffiliateTransaction criada (None em caso de falha).
     """
     async with AsyncSessionLocal() as s:
         aff = await s.get(Affiliate, user_id)
         if not aff:
-            return False, "Afiliado não encontrado."
+            return False, "Afiliado não encontrado.", None
         if points <= 0:
-            return False, "Quantidade inválida."
+            return False, "Quantidade inválida.", None
         if aff.points_balance < points:
-            return False, f"Pontos insuficientes (disponível: {aff.points_balance})."
+            return False, f"Pontos insuficientes (disponível: {aff.points_balance}).", None
 
         settings = await get_settings()
         rate = getattr(settings, "points_conversion_rate", 100.0)
         if rate <= 0:
-            return False, "Taxa de conversão inválida."
+            return False, "Taxa de conversão inválida.", None
 
         min_pts = getattr(settings, "min_points_to_convert", 1)
         if points < min_pts:
-            return False, f"Mínimo para converter: {min_pts} pts."
+            return False, f"Mínimo para converter: {min_pts} pts.", None
 
         max_pts = getattr(settings, "max_points_per_conversion", 0)
         if max_pts > 0 and points > max_pts:
-            return False, f"Máximo por conversão: {max_pts} pts."
+            return False, f"Máximo por conversão: {max_pts} pts.", None
 
-        value = points / rate
+        value = round(points / rate, 2)
         old = aff.points_balance
         aff.points_balance -= points
         aff.total_points_converted += points
@@ -1500,36 +1503,47 @@ async def convert_points_to_balance(user_id: int, points: int) -> tuple[bool, st
         if not wallet:
             wallet = Wallet(user_id=user_id, balance=0.0)
             s.add(wallet)
-        before = wallet.balance
-        wallet.balance += value
+            await s.flush()
 
-        s.add(AffiliateTransaction(
+        before = wallet.balance
+        wallet.balance = round(wallet.balance + value, 2)
+        new_balance = wallet.balance
+
+        # Cria AffiliateTransaction e captura o ID antes do commit
+        aff_tx = AffiliateTransaction(
             user_id=user_id,
             amount=-points,
             type="conversion",
             description=f"Conversão de {points} pts → R$ {value:.2f}",
             balance_before=old,
             balance_after=aff.points_balance,
-        ))
+        )
+        s.add(aff_tx)
+        await s.flush()
+        op_id = aff_tx.id
+
         s.add(WalletTransaction(
             user_id=user_id,
             amount=value,
             type="points_conversion",
-            description=f"{points} pts convertidos",
+            description=f"{points} pts convertidos (op #{op_id})",
             balance_before=before,
-            balance_after=wallet.balance,
+            balance_after=new_balance,
         ))
+
         await s.commit()
 
+    # Notificação ao usuário (com o ID da operação)
     try:
         await bot.send_message(
             user_id,
             f"💱 <b>CONVERSÃO REALIZADA!</b>\n\n"
             f"🏆 Pontos utilizados: {points}\n"
             f"💰 Valor creditado: R$ {value:.2f}\n"
-            f"💎 Novo saldo: R$ {wallet.balance:.2f}",
+            f"💎 Novo saldo: R$ {new_balance:.2f}\n"
+            f"🆔 Operação: #{op_id}",
         )
     except Exception:
         pass
 
-    return True, f"✅ Convertido: {points} pts → R$ {value:.2f}"
+    return True, f"✅ Convertido: {points} pts → R$ {value:.2f}", op_id
