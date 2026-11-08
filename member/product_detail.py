@@ -68,7 +68,7 @@ async def _get_balance(user_id: int) -> float:
 
 
 # ============================================================
-# HELPER CENTRAL DE ATUALIZAÇÃO (§1)
+# HELPERS DE UPDATE
 # ============================================================
 async def _update_to_product(
     target: Message | CallbackQuery,
@@ -76,6 +76,7 @@ async def _update_to_product(
     kb: InlineKeyboardMarkup | None,
     image_url: str | None,
 ):
+    """§1 — edita sempre que possível."""
     is_cb = isinstance(target, CallbackQuery)
     msg = target.message if is_cb else target
 
@@ -124,6 +125,21 @@ async def _update_to_product(
         return
 
 
+async def _safe_edit_or_answer(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup | None):
+    """Edita se for texto; deleta+envia se for foto (evita falha silenciosa)."""
+    if cb.message.photo:
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
+        await cb.message.answer(text, reply_markup=kb)
+        return
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await cb.message.answer(text, reply_markup=kb)
+
+
 # ============================================================
 # DETALHE DO PRODUTO
 # ============================================================
@@ -132,7 +148,7 @@ def _personalize_detail_kb(kb: InlineKeyboardMarkup, product_id: int) -> InlineK
         "buy_now":       f"pd_buy_now_{product_id}",
         "buy_qty":       f"pd_buy_qty_{product_id}",
         "add_cart":      f"pd_add_cart_{product_id}",
-        "show_recharge": "show_recharge",
+        "show_recharge": f"pd_add_balance_{product_id}",  # ← corrigido (#4)
         "show_catalog":  "show_catalog",
     }
     new_rows = []
@@ -195,7 +211,7 @@ async def _build_detail(product_id: int, user_id: int):
             [InlineKeyboardButton(text="🛒 Comprar agora", callback_data=f"pd_buy_now_{product_id}")],
             [InlineKeyboardButton(text="🔢 Comprar quantidade", callback_data=f"pd_buy_qty_{product_id}")],
             [InlineKeyboardButton(text="🧺 Adicionar ao carrinho", callback_data=f"pd_add_cart_{product_id}")],
-            [InlineKeyboardButton(text="💎 Adicionar saldo", callback_data="show_recharge")],
+            [InlineKeyboardButton(text="💎 Adicionar saldo", callback_data=f"pd_add_balance_{product_id}")],  # ← corrigido (#4)
             [InlineKeyboardButton(text="↩️ Voltar", callback_data="show_catalog")],
         ])
 
@@ -227,6 +243,53 @@ async def cb_show_product(cb: CallbackQuery, state: FSMContext):
 
     text, kb, image_url = result
     await _update_to_product(cb, text, kb, image_url)
+    await cb.answer()
+
+
+# ============================================================
+# §8.5 — ADICIONAR SALDO DIRETO DO PRODUTO (contexto preservado)
+# ============================================================
+@router.callback_query(F.data.startswith("pd_add_balance_"))
+async def cb_pd_add_balance(cb: CallbackQuery, state: FSMContext):
+    try:
+        pid = int(cb.data.replace("pd_add_balance_", ""))
+    except (ValueError, TypeError):
+        await cb.answer("Produto inválido.", show_alert=True)
+        return
+
+    # Salva o contexto de origem ANTES de entrar no fluxo único de recarga
+    await state.update_data(
+        return_ctx="product",
+        return_product_id=pid,
+    )
+
+    settings = await get_settings()
+    if not getattr(settings, "recharge_enabled", True):
+        await cb.answer("💳 As recargas estão desativadas no momento.", show_alert=True)
+        return
+
+    mp_token = getattr(settings, "mp_access_token", None)
+    if not mp_token:
+        await _safe_edit_or_answer(
+            cb,
+            "⚠️ O PIX está temporariamente indisponível.\n\nEntre em contato com o suporte.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏠 Menu principal", callback_data="main_menu")],
+            ]),
+        )
+        await cb.answer()
+        return
+
+    text = (
+        "💳 Selecione a opção desejada para adicionar saldo via PIX!\n\n"
+        "🔹 Adicione crédito de forma rápida e segura com PIX.\n"
+        "💸 Escolha o valor e faça o pagamento."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💠 PIX automático", callback_data="recharge_pix")],
+        [InlineKeyboardButton(text="↩️ Voltar", callback_data="recharge_back")],
+    ])
+    await _safe_edit_or_answer(cb, text, kb)
     await cb.answer()
 
 
@@ -303,20 +366,15 @@ async def _show_insufficient_balance(
         [InlineKeyboardButton(text="↩️ Voltar", callback_data=f"show_product_{product_id}")],
     ])
     if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=kb)
+        await _safe_edit_or_answer(target, text, kb)
     else:
         await target.answer(text, reply_markup=kb)
 
 
 # ============================================================
-# §9.2 — RESUMO DO PEDIDO (etapa intermediária)
+# §9.2 — RESUMO DO PEDIDO
 # ============================================================
 async def show_purchase_summary(target, product_id: int, quantity: int, data: dict):
-    """
-    Renderiza o RESUMO DO PEDIDO (§9.2).
-    Etapa intermediária entre escolher a quantidade e confirmar a compra.
-    Público — usado também pelo wallet.py após retorno da recarga (§9.3).
-    """
     p = data["product"]
     balance = data["balance"]
     total = data["total"]
@@ -353,7 +411,7 @@ async def show_purchase_summary(target, product_id: int, quantity: int, data: di
 
 
 # ============================================================
-# §9.4 — CONFIRMAR PEDIDO (quantidade > 1 ou veio do resumo)
+# §9.4 — CONFIRMAR PEDIDO (quantidade > 1)
 # ============================================================
 async def _render_confirmation_quantity(target, product, quantity: int, price: float, balance: float):
     total = round(price * quantity, 2)
@@ -390,7 +448,7 @@ async def _render_confirmation_quantity(target, product, quantity: int, price: f
 
 
 # ============================================================
-# §6.1 — CONFIRMAÇÃO DA COMPRA (comprar agora, qtd = 1)
+# §6.1 — CONFIRMAÇÃO DA COMPRA (comprar agora)
 # ============================================================
 async def _render_confirmation_buy_now(target, product, price: float, balance: float):
     total = round(price, 2)
@@ -426,7 +484,7 @@ async def _render_confirmation_buy_now(target, product, price: float, balance: f
 
 
 # ============================================================
-# BUY NOW → §6.1 direto
+# BUY NOW
 # ============================================================
 @router.callback_query(F.data.startswith("pd_buy_now_"))
 async def cb_buy_now(cb: CallbackQuery, state: FSMContext):
@@ -454,7 +512,7 @@ async def cb_buy_now(cb: CallbackQuery, state: FSMContext):
 
 
 # ============================================================
-# MENU DE ESCOLHA DE QUANTIDADE (§9)
+# MENU DE ESCOLHA DE QUANTIDADE
 # ============================================================
 async def _show_qty_menu(cb: CallbackQuery, pid: int):
     async with AsyncSessionLocal() as s:
@@ -534,7 +592,7 @@ async def cb_change_qty(cb: CallbackQuery):
 
 
 # ============================================================
-# ESCOLHA DE QUANTIDADE → §9.2 RESUMO
+# ESCOLHA DE QUANTIDADE → §9.2
 # ============================================================
 @router.callback_query(F.data.startswith("pd_qty_pick_"))
 async def cb_qty_pick(cb: CallbackQuery, state: FSMContext):
@@ -621,9 +679,13 @@ async def msg_quantity_input(m: Message, state: FSMContext):
 
     if not ok:
         if err == "insufficient_balance":
-            await _show_insufficient_balance_nostate(
-                m, result["missing"], pid, qty,
+            # Salva o contexto de novo (state.clear() apagou) — preserva retorno após recarga
+            await state.update_data(
+                return_ctx="purchase_summary",
+                return_product_id=pid,
+                return_quantity=qty,
             )
+            await _show_insufficient_balance_nostate(m, result["missing"], pid, qty)
         else:
             await m.answer(f"❌ {err}")
         return
@@ -661,7 +723,6 @@ async def cb_continue(cb: CallbackQuery, state: FSMContext):
         await cb.answer("Parâmetros inválidos.", show_alert=True)
         return
 
-    # Revalida saldo e estoque (podem ter mudado entre resumo e continuar)
     ok, err, data = await _check_buy(pid, cb.from_user.id, qty)
 
     if not ok:
