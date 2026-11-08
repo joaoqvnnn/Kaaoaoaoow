@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Router, F
 from aiogram.types import (
@@ -484,6 +484,10 @@ async def _execute_cart_purchase(user_id: int) -> dict:
         items_result = []
 
         for item, p, price, subtotal in valid:
+            expires_at = None
+            if p.validity_days and p.validity_days > 0:
+                expires_at = datetime.utcnow() + timedelta(days=p.validity_days)
+
             order = Order(
                 user_id=user_id,
                 product_id=p.id,
@@ -496,6 +500,7 @@ async def _execute_cart_purchase(user_id: int) -> dict:
                     "activation_link": p.activation_link or "",
                 },
                 processed_at=datetime.utcnow(),
+                expires_at=expires_at,          # ← NOVO
             )
             s.add(order)
             await s.flush()
