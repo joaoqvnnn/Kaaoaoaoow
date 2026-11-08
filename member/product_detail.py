@@ -68,7 +68,7 @@ async def _get_balance(user_id: int) -> float:
 
 
 # ============================================================
-# HELPER CENTRAL DE ATUALIZAÇÃO (§1 — editar sempre que possível)
+# HELPER CENTRAL DE ATUALIZAÇÃO (§1)
 # ============================================================
 async def _update_to_product(
     target: Message | CallbackQuery,
@@ -76,19 +76,12 @@ async def _update_to_product(
     kb: InlineKeyboardMarkup | None,
     image_url: str | None,
 ):
-    """
-    Atualiza a mensagem atual para a tela de produto respeitando §1:
-    - Texto → texto: edit_text (edição pura)
-    - Foto → foto: edit_media (troca mídia + caption, mesma mensagem)
-    - Texto → foto ou foto → texto: delete + answer (limitação do Telegram)
-    """
     is_cb = isinstance(target, CallbackQuery)
     msg = target.message if is_cb else target
 
     has_photo_now = bool(getattr(msg, "photo", None))
     has_photo_new = bool(image_url)
 
-    # Caso 1 — texto → texto: edita
     if not has_photo_now and not has_photo_new:
         try:
             await msg.edit_text(text, reply_markup=kb)
@@ -98,7 +91,6 @@ async def _update_to_product(
         await msg.answer(text, reply_markup=kb)
         return
 
-    # Caso 2 — foto → foto: troca mídia + legenda
     if has_photo_now and has_photo_new:
         try:
             await msg.edit_media(
@@ -108,7 +100,6 @@ async def _update_to_product(
             return
         except Exception:
             pass
-        # fallback: recria a mensagem
         try:
             await msg.delete()
         except Exception:
@@ -116,7 +107,6 @@ async def _update_to_product(
         await msg.answer_photo(photo=image_url, caption=text, reply_markup=kb)
         return
 
-    # Caso 3 — texto → foto (Telegram não permite converter)
     if not has_photo_now and has_photo_new:
         try:
             await msg.delete()
@@ -125,7 +115,6 @@ async def _update_to_product(
         await msg.answer_photo(photo=image_url, caption=text, reply_markup=kb)
         return
 
-    # Caso 4 — foto → texto (Telegram não permite converter)
     if has_photo_now and not has_photo_new:
         try:
             await msg.delete()
@@ -237,7 +226,6 @@ async def cb_show_product(cb: CallbackQuery, state: FSMContext):
         return
 
     text, kb, image_url = result
-
     await _update_to_product(cb, text, kb, image_url)
     await cb.answer()
 
@@ -320,30 +308,37 @@ async def _show_insufficient_balance(
         await target.answer(text, reply_markup=kb)
 
 
+# ============================================================
+# §9.2 — RESUMO DO PEDIDO (etapa intermediária)
+# ============================================================
 async def show_purchase_summary(target, product_id: int, quantity: int, data: dict):
-    """Resumo/confirmação. Usado também pelo wallet.py após retornar da recarga."""
+    """
+    Renderiza o RESUMO DO PEDIDO (§9.2).
+    Etapa intermediária entre escolher a quantidade e confirmar a compra.
+    Público — usado também pelo wallet.py após retorno da recarga (§9.3).
+    """
     p = data["product"]
     balance = data["balance"]
     total = data["total"]
     price = data["price"]
-    after = round(balance - total, 2)
 
     text = (
-        f"🛍️ CONFIRMAÇÃO DA COMPRA\n\n"
-        f"Seu pedido está pronto para confirmação!\n\n"
-        f"◈ Produto: {p.name}\n"
-        f"◈ Quantidade: {quantity}\n"
-        f"◈ Valor unitário: R$ {price:.2f}\n"
-        f"◈ Total: R$ {total:.2f}\n\n"
+        f"◈ RESUMO DO PEDIDO\n\n"
+        f"📦 Produto: {p.name}\n"
+        f"🔢 Quantidade: {quantity}\n"
+        f"💰 Valor unitário: R$ {price:.2f}\n\n"
         f"━━━━━━━━━━━━━━\n\n"
-        f"💎 Saldo atual: R$ {balance:.2f}\n"
-        f"💰 Saldo após a compra: R$ {after:.2f}\n\n"
-        f"Deseja confirmar seu pedido?"
+        f"💳 Total: R$ {total:.2f}\n"
+        f"💎 Seu saldo: R$ {balance:.2f}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text="✅ Confirmar compra",
-            callback_data=f"pd_confirm_{product_id}_{quantity}",
+            text="✅ Continuar",
+            callback_data=f"pd_continue_{product_id}_{quantity}",
+        )],
+        [InlineKeyboardButton(
+            text="🔢 Alterar quantidade",
+            callback_data=f"pd_change_qty_{product_id}",
         )],
         [InlineKeyboardButton(
             text="↩️ Cancelar",
@@ -358,7 +353,80 @@ async def show_purchase_summary(target, product_id: int, quantity: int, data: di
 
 
 # ============================================================
-# BUY NOW
+# §9.4 — CONFIRMAR PEDIDO (quantidade > 1 ou veio do resumo)
+# ============================================================
+async def _render_confirmation_quantity(target, product, quantity: int, price: float, balance: float):
+    total = round(price * quantity, 2)
+    after = round(balance - total, 2)
+
+    text = (
+        f"🛍️ CONFIRMAR PEDIDO\n\n"
+        f"📦 Produto: {product.name}\n"
+        f"🔢 Quantidade: {quantity}\n"
+        f"💰 Total: R$ {total:.2f}\n\n"
+        f"💎 Saldo atual: R$ {balance:.2f}\n"
+        f"💳 Saldo após compra: R$ {after:.2f}\n\n"
+        f"Deseja confirmar?"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✅ Confirmar compra",
+            callback_data=f"pd_confirm_{product.id}_{quantity}",
+        )],
+        [InlineKeyboardButton(
+            text="✏️ Alterar quantidade",
+            callback_data=f"pd_change_qty_{product.id}",
+        )],
+        [InlineKeyboardButton(
+            text="❌ Cancelar pedido",
+            callback_data=f"pd_cancel_{product.id}",
+        )],
+    ])
+
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb)
+
+
+# ============================================================
+# §6.1 — CONFIRMAÇÃO DA COMPRA (comprar agora, qtd = 1)
+# ============================================================
+async def _render_confirmation_buy_now(target, product, price: float, balance: float):
+    total = round(price, 2)
+    after = round(balance - total, 2)
+
+    text = (
+        f"🛍️ CONFIRMAÇÃO DA COMPRA\n\n"
+        f"Seu pedido está pronto para confirmação!\n\n"
+        f"◈ Produto: {product.name}\n"
+        f"◈ Quantidade: 1\n"
+        f"◈ Valor unitário: R$ {price:.2f}\n"
+        f"◈ Total: R$ {total:.2f}\n\n"
+        f"━━━━━━━━━━━━━━\n\n"
+        f"💎 Saldo atual: R$ {balance:.2f}\n"
+        f"💰 Saldo após a compra: R$ {after:.2f}\n\n"
+        f"Deseja confirmar seu pedido?"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✅ Confirmar compra",
+            callback_data=f"pd_confirm_{product.id}_1",
+        )],
+        [InlineKeyboardButton(
+            text="↩️ Cancelar",
+            callback_data=f"pd_cancel_{product.id}",
+        )],
+    ])
+
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb)
+
+
+# ============================================================
+# BUY NOW → §6.1 direto
 # ============================================================
 @router.callback_query(F.data.startswith("pd_buy_now_"))
 async def cb_buy_now(cb: CallbackQuery, state: FSMContext):
@@ -381,21 +449,14 @@ async def cb_buy_now(cb: CallbackQuery, state: FSMContext):
             await cb.answer(err, show_alert=True)
         return
 
-    await show_purchase_summary(cb, pid, 1, data)
+    await _render_confirmation_buy_now(cb, data["product"], data["price"], data["balance"])
     await cb.answer()
 
 
 # ============================================================
-# BUY QUANTITY
+# MENU DE ESCOLHA DE QUANTIDADE (§9)
 # ============================================================
-@router.callback_query(F.data.startswith("pd_buy_qty_"))
-async def cb_buy_qty(cb: CallbackQuery):
-    try:
-        pid = int(cb.data.replace("pd_buy_qty_", ""))
-    except (ValueError, TypeError):
-        await cb.answer("Produto inválido.", show_alert=True)
-        return
-
+async def _show_qty_menu(cb: CallbackQuery, pid: int):
     async with AsyncSessionLocal() as s:
         p = await s.get(Product, pid)
 
@@ -448,9 +509,33 @@ async def cb_buy_qty(cb: CallbackQuery):
     )])
 
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("pd_buy_qty_"))
+async def cb_buy_qty(cb: CallbackQuery):
+    try:
+        pid = int(cb.data.replace("pd_buy_qty_", ""))
+    except (ValueError, TypeError):
+        await cb.answer("Produto inválido.", show_alert=True)
+        return
+    await _show_qty_menu(cb, pid)
     await cb.answer()
 
 
+@router.callback_query(F.data.startswith("pd_change_qty_"))
+async def cb_change_qty(cb: CallbackQuery):
+    try:
+        pid = int(cb.data.replace("pd_change_qty_", ""))
+    except (ValueError, TypeError):
+        await cb.answer("Produto inválido.", show_alert=True)
+        return
+    await _show_qty_menu(cb, pid)
+    await cb.answer()
+
+
+# ============================================================
+# ESCOLHA DE QUANTIDADE → §9.2 RESUMO
+# ============================================================
 @router.callback_query(F.data.startswith("pd_qty_pick_"))
 async def cb_qty_pick(cb: CallbackQuery, state: FSMContext):
     rest = cb.data.replace("pd_qty_pick_", "")
@@ -563,6 +648,40 @@ async def _show_insufficient_balance_nostate(
 
 
 # ============================================================
+# CONTINUAR (§9.2 → §9.4)
+# ============================================================
+@router.callback_query(F.data.startswith("pd_continue_"))
+async def cb_continue(cb: CallbackQuery, state: FSMContext):
+    rest = cb.data.replace("pd_continue_", "")
+    try:
+        pid_s, qty_s = rest.rsplit("_", 1)
+        pid = int(pid_s)
+        qty = int(qty_s)
+    except (ValueError, IndexError):
+        await cb.answer("Parâmetros inválidos.", show_alert=True)
+        return
+
+    # Revalida saldo e estoque (podem ter mudado entre resumo e continuar)
+    ok, err, data = await _check_buy(pid, cb.from_user.id, qty)
+
+    if not ok:
+        if err == "insufficient_balance":
+            await _show_insufficient_balance(
+                cb, data["missing"], pid, state,
+                return_ctx="purchase_summary", quantity=qty,
+            )
+            await cb.answer()
+        else:
+            await cb.answer(err, show_alert=True)
+        return
+
+    await _render_confirmation_quantity(
+        cb, data["product"], qty, data["price"], data["balance"],
+    )
+    await cb.answer()
+
+
+# ============================================================
 # ADICIONAR AO CARRINHO
 # ============================================================
 @router.callback_query(F.data.startswith("pd_add_cart_"))
@@ -646,7 +765,7 @@ async def cb_cancel_purchase(cb: CallbackQuery, state: FSMContext):
 
 
 # ============================================================
-# CONFIRMAR COMPRA — anti-duplo
+# CONFIRMAR COMPRA (execução)
 # ============================================================
 @router.callback_query(F.data.startswith("pd_confirm_"))
 async def cb_confirm_purchase(cb: CallbackQuery):
