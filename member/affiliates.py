@@ -11,7 +11,7 @@ from datetime import datetime
 from bot import dp
 from database import AsyncSessionLocal
 from models import (
-    Affiliate, AffiliateTransaction, Referral, User, Wallet,
+    Affiliate, AffiliateTransaction, Referral, User, Wallet, Order,
 )
 from settings_cache import get_settings
 
@@ -145,7 +145,7 @@ async def cb_show_affiliates(cb: CallbackQuery, state: FSMContext):
 
 
 # ============================================================
-# CONVERSÃO DE PONTOS — MENU
+# CONVERSÃO — MENU
 # ============================================================
 @router.callback_query(F.data == "show_convert_points")
 async def cb_show_convert(cb: CallbackQuery, state: FSMContext):
@@ -302,7 +302,7 @@ async def msg_convert_custom(m: Message, state: FSMContext):
 
 
 # ============================================================
-# CONVERSÃO — EXECUTAR
+# CONVERSÃO — EXECUTAR (§14.4)
 # ============================================================
 @router.callback_query(F.data.startswith("aff_convert_confirm_"))
 async def cb_convert_execute(cb: CallbackQuery):
@@ -312,7 +312,7 @@ async def cb_convert_execute(cb: CallbackQuery):
         await cb.answer("Valor inválido.", show_alert=True)
         return
 
-    ok, msg = await convert_points_to_balance(cb.from_user.id, points)
+    ok, msg, op_id = await convert_points_to_balance(cb.from_user.id, points)
 
     if not ok:
         await cb.message.edit_text(
@@ -333,12 +333,15 @@ async def cb_convert_execute(cb: CallbackQuery):
         w = await s.get(Wallet, cb.from_user.id)
     new_balance = w.balance if w else 0.0
 
+    op_line = f"\n\n🆔 Operação: #{op_id}" if op_id else ""
+
     text = (
         f"✅ CONVERSÃO REALIZADA!\n\n"
         f"Seus pontos foram convertidos com sucesso.\n\n"
         f"💎 Saldo adicionado: R$ {value:.2f}\n"
         f"🏆 Pontos utilizados: {points}\n"
-        f"💰 Novo saldo: R$ {new_balance:.2f}\n\n"
+        f"💰 Novo saldo: R$ {new_balance:.2f}"
+        f"{op_line}\n\n"
         f"🏆 Pontos restantes: {new_aff.points_balance}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
