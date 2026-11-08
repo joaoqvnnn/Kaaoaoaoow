@@ -16,6 +16,7 @@ from settings_cache import get_settings
 from admin.customization import (
     get_rendered_message, get_rendered_image, get_or_create_template,
 )
+from settings_cache import get_settings, get_greeting
 from admin.deeplinks import register_deeplink_visit
 from admin.affiliates import process_referral_on_start
 
@@ -47,15 +48,6 @@ def _clear_block_msg(user_id: int):
 # ============================================================
 # HELPERS
 # ============================================================
-def _greeting() -> str:
-    h = datetime.now().hour
-    if 5 <= h < 12:
-        return "Bom dia"
-    if 12 <= h < 18:
-        return "Boa tarde"
-    return "Boa noite"
-
-
 async def _get_or_create_user(user_id: int, full_name: str, username: str) -> tuple[User, bool]:
     async with AsyncSessionLocal() as s:
         u = await s.get(User, user_id)
@@ -150,18 +142,19 @@ async def _build_welcome_message(
         w = await s.get(Wallet, user_id)
 
     balance = w.balance if w else 0.0
-    variables = {
-        "saudacao": _greeting(),
-        "nome_usuario": (u.full_name if u and u.full_name else "Cliente"),
+    greeting = await get_greeting()
+    nome = (u.full_name if u and u.full_name else "Cliente")
+
+    text, kb = await get_rendered_message("welcome", {
+        "saudacao": greeting,   # ← agora lê do banco
+        "nome_usuario": nome,
         "username": (u.username if u and u.username else "sem_username"),
         "telegram_id": str(user_id),
         "saldo": f"{balance:.2f}",
-    }
-
-    text, kb = await get_rendered_message("welcome", variables)
+    })
     if not text:
         text = (
-            f"☀️ {variables['saudacao']}, {variables['nome_usuario']}!\n\n"
+            f"☀️ {greeting}, {nome}!\n\n"
             f"💠 BELLAMY | DIGITAL STORE\n\n"
             f"👇 Selecione uma opção no menu."
         )
