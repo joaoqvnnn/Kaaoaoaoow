@@ -46,6 +46,8 @@ class Product(Base):
     min_stock_alert: Mapped[int] = mapped_column(Integer, default=0)
     max_stock: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # NOVO CAMPO ADICIONADO AQUI
+    validity_days: Mapped[int] = mapped_column(Integer, default=0)  # 0 = sem validade
 
 
 class Order(Base):
@@ -66,6 +68,8 @@ class Order(Base):
     # NOVAS COLUNAS ADICIONADAS AQUI
     processing_lock: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # NOVO CAMPO ADICIONADO AQUI
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class Wallet(Base):
