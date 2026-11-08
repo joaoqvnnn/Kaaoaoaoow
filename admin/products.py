@@ -32,6 +32,7 @@ class PS(StatesGroup):
     withdraw_reason = State()
     search_query = State()
     stock_config_value = State()
+    creds_bulk = State()
 
 
 def is_admin(uid: int) -> bool:
@@ -312,6 +313,7 @@ async def render_product(pid: int) -> tuple[str, InlineKeyboardMarkup]:
          InlineKeyboardButton(text="⚠️ Alerta estoque", callback_data=f"prd_ef_alert_{pid}")],
         [InlineKeyboardButton(text="📥 Abastecer", callback_data=f"prd_restock_{pid}"),
          InlineKeyboardButton(text="📤 Retirar", callback_data=f"prd_withdraw_{pid}")],
+        [InlineKeyboardButton(text="🔐 Credenciais de acesso", callback_data=f"prd_creds_{pid}")],
         [InlineKeyboardButton(
             text=("🔴 Desativar" if p.is_active else "🟢 Ativar"),
             callback_data=f"prd_toggle_{pid}")],
@@ -857,3 +859,351 @@ async def cfg_threshold_save(m: Message, state: FSMContext):
     await state.clear()
     text, kb = await stock_config_view()
     await m.answer(f"✅ Limite atualizado para {val}.", reply_markup=kb)
+
+
+# ============================================================
+# GERENCIAMENTO DE CREDENCIAIS INDIVIDUAIS (Pacote A)
+# ============================================================
+
+from models import ProductCredential
+from sqlalchemy import delete as sql_delete
+
+
+@router.callback_query(F.data.startswith("prd_creds_"))
+async def creds_menu(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+
+    try:
+        pid = int(cb.data.replace("prd_creds_", ""))
+    except (ValueError, TypeError):
+        await cb.answer("Produto inválido.", show_alert=True)
+        return
+
+    async with AsyncSessionLocal() as s:
+        p = await s.get(Product, pid)
+        if not p:
+            await cb.answer("Produto não encontrado.", show_alert=True)
+            return
+
+        total = (await s.execute(
+            select(func.count(ProductCredential.id))
+            .where(ProductCredential.product_id == pid)
+        )).scalar() or 0
+
+        available = (await s.execute(
+            select(func.count(ProductCredential.id))
+            .where(ProductCredential.product_id == pid)
+            .where(ProductCredential.is_sold == False)
+        )).scalar() or 0
+
+        sold = total - available
+
+    mode = "🔐 Pool individual" if total > 0 else "📄 Delivery único"
+    note = ""
+    if total > 0:
+        note = (
+            f"\n⚠️ Este produto usa <b>pool de credenciais individuais</b>. "
+            f"Cada venda consome 1 credencial. Se o pool acabar, "
+            f"a venda é bloqueada mesmo com estoque &gt; 0."
+        )
+    else:
+        note = (
+            f"\n💡 Este produto ainda <b>não tem credenciais cadastradas</b> "
+            f"e usa o campo de delivery único (informações de entrega). "
+            f"Ao cadastrar a primeira credencial, o modo muda automaticamente."
+        )
+
+    text = (
+        f"🔐 CREDENCIAIS — {p.name}\n\n"
+        f"📊 Modo atual: {mode}\n"
+        f"📦 Total cadastradas: {total}\n"
+        f"🟢 Disponíveis: {available}\n"
+        f"🔴 Vendidas: {sold}\n"
+        f"{note}"
+    )
+
+    buttons = [
+        [InlineKeyboardButton(
+            text="➕ Adicionar credenciais em lote",
+            callback_data=f"prd_creds_add_{pid}",
+        )],
+        [InlineKeyboardButton(
+            text=f"📋 Listar disponíveis ({available})",
+            callback_data=f"prd_creds_list_{pid}_avail_0",
+        )],
+        [InlineKeyboardButton(
+            text=f"🔴 Ver vendidas ({sold})",
+            callback_data=f"prd_creds_list_{pid}_sold_0",
+        )],
+        [InlineKeyboardButton(
+            text="🗑️ Limpar todas as disponíveis",
+            callback_data=f"prd_creds_clear_{pid}",
+        )],
+        [InlineKeyboardButton(text="↩️ Voltar", callback_data=f"prd_view_{pid}")],
+    ]
+    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("prd_creds_add_"))
+async def creds_add_start(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+    try:
+        pid = int(cb.data.replace("prd_creds_add_", ""))
+    except (ValueError, TypeError):
+        await cb.answer("Produto inválido.", show_alert=True)
+        return
+
+    await state.update_data(creds_product_id=pid)
+    await state.set_state(PS.creds_bulk)
+    await cb.message.answer(
+        f"➕ ADICIONAR CREDENCIAIS EM LOTE\n\n"
+        f"Produto: <code>#{pid}</code>\n\n"
+        f"Envie uma lista com 1 credencial por linha no formato:\n\n"
+        f"<code>email|senha</code>\n"
+        f"<code>email|senha|extra1|extra2</code>\n\n"
+        f"Exemplo:\n"
+        f"<code>user1@mail.com|senha123</code>\n"
+        f"<code>user2@mail.com|senha456|perfil=premium</code>\n\n"
+        f"Digite /cancelar para abortar."
+    )
+    await cb.answer()
+
+
+@router.message(PS.creds_bulk)
+async def creds_add_save(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+
+    raw = (m.text or "").strip()
+    if raw.lower() == "/cancelar":
+        await state.clear()
+        await m.answer("Operação cancelada.")
+        return
+
+    data = await state.get_data()
+    pid = data.get("creds_product_id")
+    await state.clear()
+
+    if not pid:
+        await m.answer("❌ Sessão expirada.")
+        return
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        await m.answer("❌ Nenhuma linha válida.")
+        return
+
+    inserted = 0
+    errors = []
+
+    async with AsyncSessionLocal() as s:
+        for i, line in enumerate(lines, 1):
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) < 2 or not parts[0] or not parts[1]:
+                errors.append(f"Linha {i}: formato inválido")
+                continue
+
+            email = parts[0][:500]
+            password = parts[1][:500]
+            extra = None
+            if len(parts) > 2:
+                extra = {}
+                for extra_part in parts[2:]:
+                    if "=" in extra_part:
+                        k, v = extra_part.split("=", 1)
+                        extra[k.strip()] = v.strip()
+                    else:
+                        extra[f"extra_{len(extra) + 1}"] = extra_part
+
+            s.add(ProductCredential(
+                product_id=pid,
+                email=email,
+                password=password,
+                extra_data=extra,
+                is_sold=False,
+            ))
+            inserted += 1
+
+        await s.commit()
+
+    await log_admin(m.from_user.id, "product_creds_bulk_add", {
+        "product_id": pid, "inserted": inserted, "errors": len(errors),
+    })
+
+    text = f"✅ <b>{inserted}</b> credencial(is) adicionada(s)."
+    if errors:
+        text += f"\n\n⚠️ Linhas ignoradas ({len(errors)}):\n" + "\n".join(errors[:10])
+
+    await m.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔐 Ver credenciais", callback_data=f"prd_creds_{pid}")],
+    ]))
+
+
+@router.callback_query(F.data.startswith("prd_creds_list_"))
+async def creds_list(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+
+    rest = cb.data.replace("prd_creds_list_", "")
+    try:
+        pid_s, filt, page_s = rest.rsplit("_", 2)
+        pid = int(pid_s)
+        page = int(page_s)
+    except (ValueError, IndexError):
+        await cb.answer("Parâmetros inválidos.", show_alert=True)
+        return
+
+    page_size = 8
+    async with AsyncSessionLocal() as s:
+        stmt = select(ProductCredential).where(ProductCredential.product_id == pid)
+        cnt = select(func.count(ProductCredential.id)).where(ProductCredential.product_id == pid)
+
+        if filt == "avail":
+            stmt = stmt.where(ProductCredential.is_sold == False)
+            cnt = cnt.where(ProductCredential.is_sold == False)
+        elif filt == "sold":
+            stmt = stmt.where(ProductCredential.is_sold == True)
+            cnt = cnt.where(ProductCredential.is_sold == True)
+
+        total = (await s.execute(cnt)).scalar() or 0
+        stmt = stmt.order_by(ProductCredential.id).offset(page * page_size).limit(page_size)
+        creds = (await s.execute(stmt)).scalars().all()
+
+    title = "DISPONÍVEIS" if filt == "avail" else ("VENDIDAS" if filt == "sold" else "TODAS")
+    max_page = max(0, (total - 1) // page_size) if total else 0
+
+    lines = [f"🔐 CREDENCIAIS — {title}\n"]
+    lines.append(f"Total: {total} | Página {page + 1} de {max_page + 1}\n")
+
+    if not creds:
+        lines.append("<i>Nenhuma credencial.</i>")
+    else:
+        for c in creds:
+            icon = "🔴" if c.is_sold else "🟢"
+            lines.append(
+                f"{icon} #{c.id} | <code>{c.email or '—'}</code> | "
+                f"<code>{c.password or '—'}</code>"
+            )
+            if c.extra_data and isinstance(c.extra_data, dict):
+                extra_str = " ".join(f"{k}={v}" for k, v in c.extra_data.items())
+                lines.append(f"   {extra_str[:80]}")
+            if c.is_sold and c.order_id:
+                lines.append(f"   📦 Pedido #{c.order_id}")
+
+    buttons = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="⬅️", callback_data=f"prd_creds_list_{pid}_{filt}_{page - 1}"
+        ))
+    if (page + 1) * page_size < total:
+        nav.append(InlineKeyboardButton(
+            text="➡️", callback_data=f"prd_creds_list_{pid}_{filt}_{page + 1}"
+        ))
+    if nav:
+        buttons.append(nav)
+
+    if filt == "avail" and creds:
+        for c in creds:
+            buttons.append([InlineKeyboardButton(
+                text=f"🗑️ Excluir #{c.id}",
+                callback_data=f"prd_creds_delone_{c.id}",
+            )])
+
+    buttons.append([InlineKeyboardButton(text="↩️ Voltar", callback_data=f"prd_creds_{pid}")])
+
+    await cb.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("prd_creds_delone_"))
+async def creds_delete_one(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+    try:
+        cid = int(cb.data.replace("prd_creds_delone_", ""))
+    except (ValueError, TypeError):
+        await cb.answer("Credencial inválida.", show_alert=True)
+        return
+
+    async with AsyncSessionLocal() as s:
+        c = await s.get(ProductCredential, cid)
+        if not c:
+            await cb.answer("Não encontrada.", show_alert=True)
+            return
+        if c.is_sold:
+            await cb.answer("Não pode excluir uma credencial já vendida.", show_alert=True)
+            return
+        pid = c.product_id
+        await s.delete(c)
+        await s.commit()
+
+    await log_admin(cb.from_user.id, "product_creds_delete_one", {"credential_id": cid})
+    await cb.answer("Credencial excluída.")
+    await creds_menu_redirect(cb, pid)
+
+
+async def creds_menu_redirect(cb: CallbackQuery, pid: int):
+    cb.data = f"prd_creds_{pid}"
+    await creds_menu(cb)
+
+
+@router.callback_query(F.data.startswith("prd_creds_clear_"))
+async def creds_clear(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+    try:
+        pid = int(cb.data.replace("prd_creds_clear_", ""))
+    except (ValueError, TypeError):
+        await cb.answer("Produto inválido.", show_alert=True)
+        return
+
+    await cb.message.edit_text(
+        f"🗑️ LIMPAR CREDENCIAIS DISPONÍVEIS\n\n"
+        f"Produto: <code>#{pid}</code>\n\n"
+        f"⚠️ Todas as credenciais ainda <b>não vendidas</b> serão excluídas.\n"
+        f"As vendidas são mantidas.\n\nConfirmar?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑️ Sim, limpar", callback_data=f"prd_creds_clear_ok_{pid}")],
+            [InlineKeyboardButton(text="↩️ Cancelar", callback_data=f"prd_creds_{pid}")],
+        ]),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("prd_creds_clear_ok_"))
+async def creds_clear_confirm(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+    try:
+        pid = int(cb.data.replace("prd_creds_clear_ok_", ""))
+    except (ValueError, TypeError):
+        await cb.answer("Produto inválido.", show_alert=True)
+        return
+
+    async with AsyncSessionLocal() as s:
+        result = await s.execute(
+            sql_delete(ProductCredential)
+            .where(ProductCredential.product_id == pid)
+            .where(ProductCredential.is_sold == False)
+        )
+        await s.commit()
+        deleted = result.rowcount or 0
+
+    await log_admin(cb.from_user.id, "product_creds_clear", {
+        "product_id": pid, "deleted": deleted,
+    })
+    await cb.answer(f"🗑️ {deleted} credencial(is) removida(s).", show_alert=True)
+    await creds_menu_redirect(cb, pid)
