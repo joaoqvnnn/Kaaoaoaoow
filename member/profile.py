@@ -21,22 +21,33 @@ from admin.customization import get_rendered_message
 router = Router()
 dp.include_router(router)
 
+
+# ============================================================
+# CONSTANTES
+# ============================================================
+# Aceita ambas grafias para compatibilidade futura
+GIFT_TX_TYPES = ("gift_card", "gift")
+WITHDRAWAL_TX_TYPES = ("withdrawal", "withdraw")
+
 TX_TYPE_LABEL = {
-    "purchase": "🛒 Compra",
-    "recharge": "💎 Recarga",
-    "refund": "💜 Reembolso",
-    "bonus": "🎁 Bônus",
-    "affiliate": "🤝 Comissão",
+    "purchase":          "🛒 Compra",
+    "recharge":          "💎 Recarga",
+    "refund":            "💜 Reembolso",
+    "bonus":             "🎁 Bônus",
+    "affiliate":         "🤝 Comissão",
     "points_conversion": "🏆 Conversão",
-    "admin_add": "➕ Crédito (admin)",
-    "admin_remove": "➖ Débito (admin)",
-    "admin_correct": "🔧 Correção",
-    "withdraw": "📤 Saque",
+    "admin_add":         "➕ Crédito (admin)",
+    "admin_remove":      "➖ Débito (admin)",
+    "admin_correct":     "🔧 Correção",
+    "gift_card":         "🎁 Gift Card",
+    "gift":              "🎁 Gift Card",
+    "withdrawal":        "📤 Saque",
+    "withdraw":          "📤 Saque",
 }
 
 
 # ============================================================
-# HELPERS DE MÉTRICAS
+# COLETA DE DADOS (todas as métricas do perfil)
 # ============================================================
 async def _collect_profile_data(user_id: int) -> dict:
     async with AsyncSessionLocal() as s:
@@ -61,6 +72,23 @@ async def _collect_profile_data(user_id: int) -> dict:
             .where(Payment.status == "confirmed")
         )).scalar() or 0.0
 
+        # Gift Cards — soma de todas as WalletTransaction com type "gift_card"/"gift"
+        # e amount > 0 (crédito). Não há hardcode: se não houver transações, será 0.
+        total_gifts = (await s.execute(
+            select(func.coalesce(func.sum(WalletTransaction.amount), 0))
+            .where(WalletTransaction.user_id == user_id)
+            .where(WalletTransaction.type.in_(GIFT_TX_TYPES))
+            .where(WalletTransaction.amount > 0)
+        )).scalar() or 0.0
+
+        # Saques — soma do valor absoluto das WalletTransaction com
+        # type "withdrawal"/"withdraw". São débitos (amount negativo).
+        total_withdrawals = (await s.execute(
+            select(func.coalesce(func.abs(func.sum(WalletTransaction.amount)), 0))
+            .where(WalletTransaction.user_id == user_id)
+            .where(WalletTransaction.type.in_(WITHDRAWAL_TX_TYPES))
+        )).scalar() or 0.0
+
         aff = await s.get(Affiliate, user_id)
         points = aff.points_balance if aff else 0
         referrals_count = (await s.execute(
@@ -83,6 +111,8 @@ async def _collect_profile_data(user_id: int) -> dict:
         "total_purchases": total_purchases,
         "total_spent": total_spent,
         "total_recharges": total_recharges,
+        "total_gifts": total_gifts,
+        "total_withdrawals": total_withdrawals,
         "points": points,
         "referrals_count": referrals_count,
         "referral_link": referral_link,
@@ -90,7 +120,7 @@ async def _collect_profile_data(user_id: int) -> dict:
 
 
 # ============================================================
-# TELA DE PERFIL
+# TELA DE PERFIL (§11)
 # ============================================================
 @router.callback_query(F.data == "show_profile")
 async def cb_show_profile(cb: CallbackQuery, state: FSMContext):
@@ -111,8 +141,10 @@ async def cb_show_profile(cb: CallbackQuery, state: FSMContext):
         "saldo": f"{data['balance']:.2f}",
         "total_compras": str(data["total_purchases"]),
         "total_recargas": f"{data['total_recharges']:.2f}",
-        "total_gifts": "0.00",
-        "total_saques": "0.00",
+        # Valores reais do banco (não hardcoded). Se não houver transações,
+        # aparecem naturalmente como 0.00 — mas mudam quando houver.
+        "total_gifts": f"{data['total_gifts']:.2f}",
+        "total_saques": f"{data['total_withdrawals']:.2f}",
         "pontos_indicacao": str(data["points"]),
         "total_indicados": str(data["referrals_count"]),
         "link_indicacao": data["referral_link"],
@@ -129,6 +161,8 @@ async def cb_show_profile(cb: CallbackQuery, state: FSMContext):
             f"💎 Saldo: R$ {variables['saldo']}\n"
             f"🛒 Compras: {variables['total_compras']}\n"
             f"💎 Recargas: R$ {variables['total_recargas']}\n"
+            f"🎁 Gift Cards: R$ {variables['total_gifts']}\n"
+            f"📤 Saques: R$ {variables['total_saques']}\n"
             f"🏆 Pontos: {variables['pontos_indicacao']}\n"
             f"👥 Indicados: {variables['total_indicados']}"
         )
@@ -169,47 +203,22 @@ async def cb_show_profile(cb: CallbackQuery, state: FSMContext):
 
 
 # ============================================================
-# HISTÓRICO (TELA)
+# HISTÓRICO (§11.1)
 # ============================================================
 @router.callback_query(F.data == "show_history")
 async def cb_show_history(cb: CallbackQuery, state: FSMContext):
     await state.clear()
 
-    async with AsyncSessionLocal() as s:
-        total_purchases = (await s.execute(
-            select(func.count(Order.id))
-            .where(Order.user_id == cb.from_user.id)
-            .where(Order.status == "completed")
-        )).scalar() or 0
-
-        total_spent = (await s.execute(
-            select(func.coalesce(func.sum(Order.total), 0))
-            .where(Order.user_id == cb.from_user.id)
-            .where(Order.status == "completed")
-        )).scalar() or 0.0
-
-        total_recharges = (await s.execute(
-            select(func.coalesce(func.sum(Payment.amount), 0))
-            .where(Payment.user_id == cb.from_user.id)
-            .where(Payment.status == "confirmed")
-        )).scalar() or 0.0
-
-        total_tx = (await s.execute(
-            select(func.count(WalletTransaction.id))
-            .where(WalletTransaction.user_id == cb.from_user.id)
-        )).scalar() or 0
-
-        w = await s.get(Wallet, cb.from_user.id)
-
-    balance = w.balance if w else 0.0
+    data = await _collect_profile_data(cb.from_user.id)
 
     text = (
         "◈ BELLAMY | HISTÓRICO\n\n"
         "Confira suas movimentações.\n\n"
-        f"💰 Compras: {total_purchases} (R$ {total_spent:.2f})\n"
-        f"💎 Recargas: R$ {total_recharges:.2f}\n"
-        f"📊 Movimentações: {total_tx}\n"
-        f"💳 Saldo atual: R$ {balance:.2f}"
+        f"💰 Compras: {data['total_purchases']} (R$ {data['total_spent']:.2f})\n"
+        f"💎 Recargas: R$ {data['total_recharges']:.2f}\n"
+        f"🎁 Gift Cards: R$ {data['total_gifts']:.2f}\n"
+        f"📤 Saques: R$ {data['total_withdrawals']:.2f}\n"
+        f"💳 Saldo atual: R$ {data['balance']:.2f}"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -331,9 +340,7 @@ async def cb_history_pdf(cb: CallbackQuery):
     try:
         pdf_bytes = await _build_history_pdf(cb.from_user.id)
     except Exception as e:
-        await cb.message.answer(
-            f"❌ Erro ao gerar PDF: {str(e)[:200]}"
-        )
+        await cb.message.answer(f"❌ Erro ao gerar PDF: {str(e)[:200]}")
         return
 
     if not pdf_bytes:
@@ -356,11 +363,9 @@ async def cb_history_pdf(cb: CallbackQuery):
 
 
 async def _build_history_pdf(user_id: int) -> bytes | None:
-    """Gera um PDF do histórico usando fpdf2 (import tardio)."""
     try:
         from fpdf import FPDF
     except ImportError:
-        # Fallback: gera TXT se fpdf2 não estiver instalado
         return await _build_history_txt(user_id)
 
     async with AsyncSessionLocal() as s:
@@ -380,14 +385,12 @@ async def _build_history_pdf(user_id: int) -> bytes | None:
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # Cabeçalho
     pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 10, "BELLAMY | Historico de Movimentacoes", ln=True, align="C")
     pdf.set_font("Helvetica", "", 9)
     pdf.cell(0, 5, f"Gerado em: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC", ln=True, align="C")
     pdf.ln(4)
 
-    # Dados do usuário
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 6, "Dados do Cliente", ln=True)
     pdf.set_font("Helvetica", "", 10)
@@ -397,27 +400,24 @@ async def _build_history_pdf(user_id: int) -> bytes | None:
     pdf.cell(0, 5, f"Saldo atual: R$ {(w.balance if w else 0.0):.2f}", ln=True)
     pdf.ln(4)
 
-    # Cabeçalho da tabela
     pdf.set_font("Helvetica", "B", 9)
     pdf.set_fill_color(40, 40, 80)
     pdf.set_text_color(255, 255, 255)
 
     col_widths = [10, 32, 40, 22, 22, 22, 32]
     headers = ["#", "Data", "Descricao", "Tipo", "Valor", "Saldo apos", "Referencia"]
-
     for i, h in enumerate(headers):
         pdf.cell(col_widths[i], 7, h, border=1, fill=True, align="C")
     pdf.ln()
 
-    # Linhas
     pdf.set_text_color(0, 0, 0)
     pdf.set_font("Helvetica", "", 8)
 
     for idx, tx in enumerate(txs, 1):
         sign = "+" if tx.amount >= 0 else "-"
-        tipo = TX_TYPE_LABEL.get(tx.type, tx.type).replace("🛒", "").replace("💎", "")
-        tipo = tipo.replace("💜", "").replace("🎁", "").replace("🤝", "").replace("🏆", "").strip()
-        tipo = tipo.replace("➕", "+").replace("➖", "-").replace("🔧", "").strip()
+        tipo = TX_TYPE_LABEL.get(tx.type, tx.type)
+        for e in ("🛒", "💎", "💜", "🎁", "🤝", "🏆", "➕", "➖", "🔧", "📤"):
+            tipo = tipo.replace(e, "").strip()
         desc = (tx.description or "")[:45]
 
         vals = [
@@ -433,7 +433,6 @@ async def _build_history_pdf(user_id: int) -> bytes | None:
             pdf.cell(col_widths[i], 6, v, border=1)
         pdf.ln()
 
-    # Rodapé
     pdf.ln(4)
     pdf.set_font("Helvetica", "I", 8)
     pdf.cell(0, 5, "Este documento contem dados confidenciais. Nao compartilhe.", ln=True, align="C")
@@ -443,7 +442,6 @@ async def _build_history_pdf(user_id: int) -> bytes | None:
 
 
 async def _build_history_txt(user_id: int) -> bytes:
-    """Fallback em TXT caso fpdf2 não esteja disponível."""
     async with AsyncSessionLocal() as s:
         u = await s.get(User, user_id)
         w = await s.get(Wallet, user_id)
