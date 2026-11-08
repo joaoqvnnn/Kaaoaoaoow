@@ -1,9 +1,10 @@
+import base64
 from datetime import datetime, timedelta
 
 from aiogram import Router, F
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ForceReply,
+    ForceReply, BufferedInputFile,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -48,8 +49,26 @@ async def _calc_bonus(amount: float) -> float:
     return round(amount * (default_pct / 100.0), 2)
 
 
+def _decode_qr_base64(b64: str | None) -> bytes | None:
+    """Decodifica o QR code base64 do Mercado Pago.
+    Aceita base64 puro ou com prefixo `data:image/...;base64,`.
+    Retorna None se vazio ou inválido.
+    """
+    if not b64 or not isinstance(b64, str):
+        return None
+    try:
+        clean = b64.strip()
+        if clean.startswith("data:"):
+            if "," in clean:
+                clean = clean.split(",", 1)[1]
+            else:
+                return None
+        return base64.b64decode(clean)
+    except Exception:
+        return None
+
+
 async def _get_return_keyboard(state: FSMContext) -> list[list[InlineKeyboardButton]]:
-    """Constrói botões de retorno ao contexto de origem."""
     data = await state.get_data()
     ctx = data.get("return_ctx")
     buttons = []
@@ -127,7 +146,6 @@ async def cb_recharge_back(cb: CallbackQuery, state: FSMContext):
             await show_purchase_summary(cb, int(pid), int(qty), result)
             await cb.answer()
             return
-        # Se ainda não tem saldo, mostra de novo a tela de insuficiente
         if err == "insufficient_balance":
             await cb.message.edit_text(
                 f"⚠️ SALDO INSUFICIENTE\n\n"
@@ -174,12 +192,8 @@ async def cb_recharge_back(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-# ============================================================
-# RETORNO AO RESUMO DO PEDIDO (após recarga)
-# ============================================================
 @router.callback_query(F.data.startswith("recharge_return_summary_"))
 async def cb_recharge_return_summary(cb: CallbackQuery):
-    """Retorna ao resumo do pedido preservando produto e quantidade."""
     rest = cb.data.replace("recharge_return_summary_", "")
     try:
         pid_s, qty_s = rest.rsplit("_", 1)
@@ -250,7 +264,6 @@ async def msg_recharge_amount(m: Message, state: FSMContext):
         await m.answer(f"❌ Valor máximo: R$ {max_val:.2f}")
         return
 
-    # Limites (diário e por usuário)
     daily_limit = getattr(settings, "recharge_daily_limit", 0.0)
     per_user_limit = getattr(settings, "recharge_per_user_limit", 0.0)
 
@@ -282,7 +295,6 @@ async def msg_recharge_amount(m: Message, state: FSMContext):
             )
             return
 
-    # Horário de funcionamento
     h_start = getattr(settings, "recharge_hours_start", 0)
     h_end = getattr(settings, "recharge_hours_end", 24)
     if h_start > 0 or h_end < 24:
@@ -308,7 +320,7 @@ async def msg_recharge_amount(m: Message, state: FSMContext):
 
 
 # ============================================================
-# CRIAR COBRANÇA PIX
+# CRIAR COBRANÇA PIX (com QR Code como imagem)
 # ============================================================
 async def _create_pix_charge(target: Message, user_id: int, amount: float, bonus: float):
     settings = await get_settings()
@@ -319,7 +331,6 @@ async def _create_pix_charge(target: Message, user_id: int, amount: float, bonus
         await target.answer("⚠️ PIX indisponível no momento.")
         return
 
-    # Cria Payment local primeiro para obter ID
     async with AsyncSessionLocal() as s:
         payment = Payment(
             user_id=user_id,
@@ -336,7 +347,6 @@ async def _create_pix_charge(target: Message, user_id: int, amount: float, bonus
         await s.refresh(payment)
         payment_id = payment.id
 
-    # Cria no MP
     ext_ref = f"rcg_{payment_id}"
     try:
         mp_resp = await client.create_pix_payment(
@@ -365,19 +375,7 @@ async def _create_pix_charge(target: Message, user_id: int, amount: float, bonus
         await s.commit()
 
     pix_code = pix_data.get("pix_code") or "—"
-
-    text = (
-        f"💰 COMPRAR SALDO COM PIX AUTOMÁTICO\n\n"
-        f"⏱ Expira em: {expiration_min} minutos\n"
-        f"💰 Valor: R$ {amount:.2f}\n"
-        f"🎁 Bônus: R$ {bonus:.2f}\n"
-        f"💎 Total a receber: R$ {amount + bonus:.2f}\n"
-        f"✨ ID: {payment_id}\n\n"
-        f"━━━━━━━━━━━━━━\n\n"
-        f"💎 <b>PIX COPIA E COLA</b>\n\n"
-        f"<code>{pix_code}</code>\n\n"
-        f"🇧🇷 Após a confirmação do pagamento, seu saldo será atualizado automaticamente."
-    )
+    qr_base64 = pix_data.get("qr_code_base64")
 
     buttons = [
         [InlineKeyboardButton(
@@ -393,8 +391,54 @@ async def _create_pix_charge(target: Message, user_id: int, amount: float, bonus
             callback_data=f"recharge_cancel_{payment_id}",
         )],
     ]
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    await target.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    # Caption curto (para caber na foto do Telegram)
+    caption = (
+        f"💰 <b>COMPRAR SALDO COM PIX AUTOMÁTICO</b>\n\n"
+        f"⏱ Expira em: {expiration_min} minutos\n"
+        f"💰 Valor: R$ {amount:.2f}\n"
+        f"🎁 Bônus: R$ {bonus:.2f}\n"
+        f"💎 Total a receber: R$ {amount + bonus:.2f}\n"
+        f"✨ ID: {payment_id}"
+    )
+
+    qr_bytes = _decode_qr_base64(qr_base64)
+
+    # Tentativa 1: enviar como foto com QR code
+    if qr_bytes:
+        try:
+            photo_file = BufferedInputFile(
+                qr_bytes, filename=f"qrcode_pix_{payment_id}.png",
+            )
+            await target.answer_photo(
+                photo=photo_file,
+                caption=caption,
+                reply_markup=kb,
+            )
+            # Envia o PIX copia-e-cola em mensagem separada
+            # (o código costuma ser grande e estouraria o caption da foto)
+            await target.answer(
+                f"💎 <b>PIX COPIA E COLA</b>\n\n"
+                f"<code>{pix_code}</code>\n\n"
+                f"🇧🇷 Após a confirmação do pagamento, seu saldo "
+                f"será atualizado automaticamente."
+            )
+            return
+        except Exception as e:
+            print(f"[wallet] falha ao enviar QR como foto: {e}")
+            # Cai no fallback abaixo
+
+    # Fallback: texto apenas (quando não há QR ou o envio da foto falhou)
+    full_text = (
+        f"{caption}\n\n"
+        f"━━━━━━━━━━━━━━\n\n"
+        f"💎 <b>PIX COPIA E COLA</b>\n\n"
+        f"<code>{pix_code}</code>\n\n"
+        f"🇧🇷 Após a confirmação do pagamento, seu saldo "
+        f"será atualizado automaticamente."
+    )
+    await target.answer(full_text, reply_markup=kb)
 
 
 # ============================================================
