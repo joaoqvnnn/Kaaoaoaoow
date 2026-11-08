@@ -39,13 +39,9 @@ async def get_greeting(now_hour: int | None = None) -> str:
     """
     Retorna o texto de saudação conforme a hora atual e as faixas configuradas.
 
-    Regras:
-    - Faixas: [morning_start, morning_end) = manhã;
-              [afternoon_start, afternoon_end) = tarde;
-              restante = noite.
-    - Se as faixas se sobrepuserem ou forem inválidas, usa fallback fixo
-      (5-12 / 12-18 / resto) para nunca quebrar.
-    - Se os textos estiverem vazios, usa os padrões em português.
+    Usa getattr com defaults seguros: se as colunas ainda não existirem no
+    banco (antes do patch do models.py), cai automaticamente nos padrões
+    Bom dia / Boa tarde / Boa noite.
     """
     s = await get_settings()
     h = now_hour if now_hour is not None else datetime.now().hour
@@ -55,7 +51,6 @@ async def get_greeting(now_hour: int | None = None) -> str:
     a_start = getattr(s, "greeting_afternoon_start", 12) or 12
     a_end = getattr(s, "greeting_afternoon_end", 18) or 18
 
-    # Validação: faixas devem respeitar 0 <= start < end <= 24
     if not (0 <= m_start < m_end <= 24 and 0 <= a_start < a_end <= 24):
         m_start, m_end = 5, 12
         a_start, a_end = 12, 18
