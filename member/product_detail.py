@@ -941,6 +941,11 @@ async def _execute_purchase(user_id: int, product_id: int, quantity: int) -> dic
         product_row.stock -= quantity
         product_row.sold_count += quantity
 
+        # Calcula validade da assinatura com base no produto
+        expires_at = None
+        if product_row.validity_days and product_row.validity_days > 0:
+            expires_at = datetime.utcnow() + timedelta(days=product_row.validity_days)
+
         order = Order(
             user_id=user_id,
             product_id=product_id,
@@ -953,6 +958,7 @@ async def _execute_purchase(user_id: int, product_id: int, quantity: int) -> dic
                 "activation_link": product_row.activation_link or "",
             },
             processed_at=datetime.utcnow(),
+            expires_at=expires_at,          # ← NOVO
         )
         s.add(order)
         await s.flush()
