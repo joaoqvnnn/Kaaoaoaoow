@@ -17,19 +17,52 @@ PAGE_SIZE = 6
 
 
 # ============================================================
-# HELPERS
+# HELPERS DE STATUS
 # ============================================================
-def _status_label(order: Order, product: Product | None) -> tuple[str, str]:
-    """Retorna (emoji, label) do status da assinatura."""
+def _is_expired(order: Order) -> bool:
+    return bool(order.expires_at and order.expires_at < datetime.utcnow())
+
+
+def _status_label(order: Order) -> tuple[str, str]:
+    """
+    Calcula o status real da assinatura.
+    Retorna (emoji, label).
+    - 🟢 Ativa       → completed + (sem validade OU validade futura)
+    - ⏳ Expirada    → completed + validade passou
+    - 🔴 Cancelada   → status cancelled
+    - 💜 Reembolsada → status refunded
+    - 🟡 Pendente    → status pending
+    """
     if order.status == "cancelled":
-        return "⚪", "Cancelada"
+        return "🔴", "Cancelada"
     if order.status == "refunded":
         return "💜", "Reembolsada"
     if order.status == "pending":
         return "🟡", "Pendente"
     if order.status == "completed":
+        if _is_expired(order):
+            return "⏳", "Expirada"
         return "🟢", "Ativa"
     return "⚪", order.status.title()
+
+
+def _is_active(order: Order) -> bool:
+    return order.status == "completed" and not _is_expired(order)
+
+
+def _is_finalized(order: Order) -> bool:
+    """Finalizada = expirada, cancelada ou reembolsada."""
+    if order.status in ("cancelled", "refunded"):
+        return True
+    if order.status == "completed" and _is_expired(order):
+        return True
+    return False
+
+
+def _format_validity(order: Order) -> str:
+    if order.expires_at:
+        return order.expires_at.strftime("%d/%m/%Y %H:%M")
+    return "Sem validade (permanente)"
 
 
 def _mask_secret(text: str) -> str:
@@ -38,24 +71,20 @@ def _mask_secret(text: str) -> str:
     return "•" * min(len(text), 24)
 
 
+# ============================================================
+# LISTAGEM
+# ============================================================
 async def _fetch_subscriptions(user_id: int, page: int, only_active: bool = False):
     async with AsyncSessionLocal() as s:
-        stmt = select(Order).where(Order.user_id == user_id)
-        cnt = select(func.count(Order.id)).where(Order.user_id == user_id)
-
-        if only_active:
-            stmt = stmt.where(Order.status == "completed")
-            cnt = cnt.where(Order.status == "completed")
-
-        total = (await s.execute(cnt)).scalar() or 0
-        stmt = (
-            stmt.order_by(Order.created_at.desc())
-            .offset(page * PAGE_SIZE)
-            .limit(PAGE_SIZE)
+        # Buscar TODAS (o status real depende de expires_at, não só de status)
+        all_orders_stmt = (
+            select(Order)
+            .where(Order.user_id == user_id)
+            .order_by(Order.created_at.desc())
         )
-        orders = (await s.execute(stmt)).scalars().all()
+        all_orders = (await s.execute(all_orders_stmt)).scalars().all()
 
-        pids = list({o.product_id for o in orders})
+        pids = list({o.product_id for o in all_orders})
         prods = {}
         if pids:
             prods = {
@@ -64,29 +93,36 @@ async def _fetch_subscriptions(user_id: int, page: int, only_active: bool = Fals
                 )).scalars().all()
             }
 
-    return orders, prods, total
+    if only_active:
+        filtered = [o for o in all_orders if _is_active(o)]
+    else:
+        filtered = all_orders
+
+    total = len(filtered)
+    start = page * PAGE_SIZE
+    page_items = filtered[start:start + PAGE_SIZE]
+
+    return page_items, prods, total
 
 
 async def _stats(user_id: int) -> tuple[int, int, int]:
     async with AsyncSessionLocal() as s:
-        total = (await s.execute(
-            select(func.count(Order.id)).where(Order.user_id == user_id)
-        )).scalar() or 0
-        active = (await s.execute(
-            select(func.count(Order.id))
-            .where(Order.user_id == user_id)
-            .where(Order.status == "completed")
-        )).scalar() or 0
-        finished = total - active
-    return total, active, finished
+        orders = (await s.execute(
+            select(Order).where(Order.user_id == user_id)
+        )).scalars().all()
+
+    total = len(orders)
+    active = sum(1 for o in orders if _is_active(o))
+    finalized = sum(1 for o in orders if _is_finalized(o))
+    return total, active, finalized
 
 
 # ============================================================
-# LISTAGEM
+# RENDER DA LISTA
 # ============================================================
 async def _render_subscriptions(target, user_id: int, page: int, only_active: bool = False):
     orders, prods, total = await _fetch_subscriptions(user_id, page, only_active)
-    total_all, active_count, finished_count = await _stats(user_id)
+    total_all, active_count, finalized_count = await _stats(user_id)
 
     if total_all == 0:
         text = (
@@ -112,20 +148,29 @@ async def _render_subscriptions(target, user_id: int, page: int, only_active: bo
     header = "🟢 ATIVAS" if only_active else "📦 MINHAS ASSINATURAS"
 
     lines = [f"{header}\n"]
-    lines.append(f"📊 Total: {total_all} | 🟢 Ativas: {active_count} | ⚪ Finalizadas: {finished_count}")
+    lines.append(
+        f"📦 Cadastradas: {total_all} | "
+        f"🟢 Ativas: {active_count} | "
+        f"⚪ Finalizadas: {finalized_count}"
+    )
     lines.append(f"📄 Página {page + 1} de {max_page + 1}\n")
 
     buttons = []
-    for idx, o in enumerate(orders, 1):
+    for o in orders:
         p = prods.get(o.product_id)
-        icon, label = _status_label(o, p)
+        icon, label = _status_label(o)
         pname = p.name if p else f"Produto #{o.product_id}"
         date_str = o.created_at.strftime("%d/%m/%Y %H:%M")
+
+        validity_str = ""
+        if o.expires_at:
+            validity_str = f" | ⏳ {o.expires_at.strftime('%d/%m/%Y')}"
 
         lines.append(
             f"{icon} <b>{pname}</b>\n"
             f"   🆔 Pedido #{o.id:06d}\n"
-            f"   📅 {date_str} | {label}\n"
+            f"   📅 {date_str}{validity_str}\n"
+            f"   📌 {label}\n"
         )
 
         buttons.append([InlineKeyboardButton(
@@ -133,7 +178,6 @@ async def _render_subscriptions(target, user_id: int, page: int, only_active: bo
             callback_data=f"subs_view_{o.id}",
         )])
 
-    # Filtros
     filter_row = []
     if only_active:
         filter_row.append(InlineKeyboardButton(
@@ -146,7 +190,6 @@ async def _render_subscriptions(target, user_id: int, page: int, only_active: bo
     if filter_row:
         buttons.append(filter_row)
 
-    # Navegação
     nav = []
     prefix = "subs_active" if only_active else "subs_list"
     if page > 0:
@@ -205,9 +248,9 @@ async def cb_subs_active(cb: CallbackQuery):
 
 
 # ============================================================
-# DETALHE DA ASSINATURA
+# DETALHE DA ASSINATURA (§11.3)
 # ============================================================
-async def _render_subscription_detail(cb: CallbackQuery, order_id: int):
+async def _render_subscription_detail(cb: CallbackQuery, order_id: int, reveal: bool = False):
     async with AsyncSessionLocal() as s:
         order = await s.get(Order, order_id)
         if not order or order.user_id != cb.from_user.id:
@@ -215,31 +258,49 @@ async def _render_subscription_detail(cb: CallbackQuery, order_id: int):
             return
         p = await s.get(Product, order.product_id)
 
-    icon, label = _status_label(order, p)
+    icon, label = _status_label(order)
     pname = p.name if p else f"Produto #{order.product_id}"
 
     delivery = order.delivery_data or {}
     info = delivery.get("info", "") or ""
     activation = delivery.get("activation_link", "") or ""
 
+    validity_str = _format_validity(order)
+
+    # Linha extra de "dias restantes" quando ativa e com validade
+    extra_line = ""
+    if order.expires_at and order.status == "completed" and not _is_expired(order):
+        remaining = (order.expires_at - datetime.utcnow()).days
+        if remaining >= 0:
+            extra_line = f"\n📆 Restam: {remaining} dia(s)"
+
+    if reveal:
+        creds_block = f"<code>{info or 'Consulte o suporte para receber seus dados.'}</code>"
+        reveal_btn = InlineKeyboardButton(
+            text="🔒 Ocultar acesso",
+            callback_data=f"subs_view_{order.id}",
+        )
+    else:
+        creds_block = _mask_secret(info)
+        reveal_btn = InlineKeyboardButton(
+            text="🔐 Visualizar acesso",
+            callback_data=f"subs_show_{order.id}",
+        )
+
     text = (
         f"◈ <b>DETALHES DA ASSINATURA</b>\n\n"
         f"📦 Produto: <b>{pname}</b>\n"
         f"🆔 Pedido: #{order.id:06d}\n"
         f"📅 Aquisição: {order.created_at.strftime('%d/%m/%Y %H:%M')}\n"
+        f"⏳ Validade: {validity_str}{extra_line}\n"
         f"📌 Status: {icon} {label}\n"
         f"🔢 Quantidade: {order.quantity}\n"
         f"💰 Total pago: R$ {order.total:.2f}\n\n"
         f"🔐 <b>DADOS DE ACESSO</b>\n\n"
-        f"{_mask_secret(info)}"
+        f"{creds_block}"
     )
 
-    buttons = [
-        [InlineKeyboardButton(
-            text="🔓 Visualizar acesso",
-            callback_data=f"subs_show_{order.id}",
-        )],
-    ]
+    buttons = [[reveal_btn]]
     if activation:
         buttons.append([InlineKeyboardButton(
             text="🌐 Ativar diretamente", url=activation,
@@ -269,13 +330,10 @@ async def cb_subs_view(cb: CallbackQuery):
     except (ValueError, TypeError):
         await cb.answer("Pedido inválido.", show_alert=True)
         return
-    await _render_subscription_detail(cb, oid)
+    await _render_subscription_detail(cb, oid, reveal=False)
     await cb.answer()
 
 
-# ============================================================
-# MOSTRAR / OCULTAR CREDENCIAIS
-# ============================================================
 @router.callback_query(F.data.startswith("subs_show_"))
 async def cb_subs_show(cb: CallbackQuery):
     try:
@@ -283,46 +341,5 @@ async def cb_subs_show(cb: CallbackQuery):
     except (ValueError, TypeError):
         await cb.answer("Pedido inválido.", show_alert=True)
         return
-
-    async with AsyncSessionLocal() as s:
-        order = await s.get(Order, oid)
-        if not order or order.user_id != cb.from_user.id:
-            await cb.answer("Assinatura não encontrada.", show_alert=True)
-            return
-        p = await s.get(Product, order.product_id)
-
-    icon, label = _status_label(order, p)
-    pname = p.name if p else f"Produto #{order.product_id}"
-
-    delivery = order.delivery_data or {}
-    info = delivery.get("info", "") or "Consulte o suporte para receber seus dados."
-    activation = delivery.get("activation_link", "") or ""
-
-    text = (
-        f"◈ <b>DETALHES DA ASSINATURA</b>\n\n"
-        f"📦 Produto: <b>{pname}</b>\n"
-        f"🆔 Pedido: #{order.id:06d}\n"
-        f"📅 Aquisição: {order.created_at.strftime('%d/%m/%Y %H:%M')}\n"
-        f"📌 Status: {icon} {label}\n\n"
-        f"🔐 <b>DADOS DE ACESSO</b>\n\n"
-        f"<code>{info}</code>"
-    )
-
-    buttons = [
-        [InlineKeyboardButton(
-            text="🔒 Ocultar acesso",
-            callback_data=f"subs_view_{order.id}",
-        )],
-    ]
-    if activation:
-        buttons.append([InlineKeyboardButton(
-            text="🌐 Ativar diretamente", url=activation,
-        )])
-    buttons.append([InlineKeyboardButton(
-        text="↩️ Voltar às assinaturas", callback_data="show_subscriptions",
-    )])
-
-    await cb.message.edit_text(
-        text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
+    await _render_subscription_detail(cb, oid, reveal=True)
     await cb.answer("Dados revelados. Não compartilhe.")
