@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 from aiogram import Router, F
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
@@ -5,8 +7,7 @@ from aiogram.types import (
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from sqlalchemy import select
-from datetime import datetime, timedelta
+from sqlalchemy import select, func
 
 from bot import dp
 from database import AsyncSessionLocal
@@ -53,7 +54,13 @@ async def _get_return_keyboard(state: FSMContext) -> list[list[InlineKeyboardBut
     ctx = data.get("return_ctx")
     buttons = []
 
-    if ctx == "cart":
+    if ctx == "purchase_summary" and data.get("return_product_id"):
+        qty = data.get("return_quantity", 1)
+        buttons.append([InlineKeyboardButton(
+            text="📋 Voltar ao resumo do pedido",
+            callback_data=f"recharge_return_summary_{data['return_product_id']}_{qty}",
+        )])
+    elif ctx == "cart":
         buttons.append([InlineKeyboardButton(
             text="🛒 Voltar ao carrinho", callback_data="show_cart",
         )])
@@ -108,8 +115,31 @@ async def cb_show_recharge(cb: CallbackQuery, state: FSMContext):
 async def cb_recharge_back(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     ctx = data.get("return_ctx")
+    pid = data.get("return_product_id")
+    qty = data.get("return_quantity", 1)
 
     await state.clear()
+
+    if ctx == "purchase_summary" and pid:
+        from member.product_detail import _check_buy, show_purchase_summary
+        ok, err, result = await _check_buy(int(pid), cb.from_user.id, int(qty))
+        if ok:
+            await show_purchase_summary(cb, int(pid), int(qty), result)
+            await cb.answer()
+            return
+        # Se ainda não tem saldo, mostra de novo a tela de insuficiente
+        if err == "insufficient_balance":
+            await cb.message.edit_text(
+                f"⚠️ SALDO INSUFICIENTE\n\n"
+                f"💰 Valor que falta: R$ {result['missing']:.2f}\n\n"
+                f"Adicione saldo e tente novamente.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💎 Adicionar saldo", callback_data="show_recharge")],
+                    [InlineKeyboardButton(text="↩️ Voltar", callback_data=f"show_product_{pid}")],
+                ]),
+            )
+            await cb.answer()
+            return
 
     if ctx == "cart":
         cb.data = "show_cart"
@@ -118,11 +148,10 @@ async def cb_recharge_back(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         return
 
-    if ctx == "product" and data.get("return_product_id"):
+    if ctx == "product" and pid:
         try:
-            pid = int(data["return_product_id"])
             from member.product_detail import _build_detail
-            result = await _build_detail(pid, cb.from_user.id)
+            result = await _build_detail(int(pid), cb.from_user.id)
             if result:
                 text, kb, image_url = result
                 if image_url:
@@ -142,6 +171,38 @@ async def cb_recharge_back(cb: CallbackQuery, state: FSMContext):
 
     from member.start import _send_welcome
     await _send_welcome(cb, edit=True)
+    await cb.answer()
+
+
+# ============================================================
+# RETORNO AO RESUMO DO PEDIDO (após recarga)
+# ============================================================
+@router.callback_query(F.data.startswith("recharge_return_summary_"))
+async def cb_recharge_return_summary(cb: CallbackQuery):
+    """Retorna ao resumo do pedido preservando produto e quantidade."""
+    rest = cb.data.replace("recharge_return_summary_", "")
+    try:
+        pid_s, qty_s = rest.rsplit("_", 1)
+        pid = int(pid_s)
+        qty = int(qty_s)
+    except (ValueError, IndexError):
+        await cb.answer("Parâmetros inválidos.", show_alert=True)
+        return
+
+    from member.product_detail import _check_buy, show_purchase_summary
+
+    ok, err, data = await _check_buy(pid, cb.from_user.id, qty)
+    if not ok:
+        if err == "insufficient_balance":
+            await cb.answer(
+                f"Saldo ainda insuficiente. Falta R$ {data['missing']:.2f}",
+                show_alert=True,
+            )
+        else:
+            await cb.answer(err, show_alert=True)
+        return
+
+    await show_purchase_summary(cb, pid, qty, data)
     await cb.answer()
 
 
@@ -189,7 +250,7 @@ async def msg_recharge_amount(m: Message, state: FSMContext):
         await m.answer(f"❌ Valor máximo: R$ {max_val:.2f}")
         return
 
-    # Verificar limite diário e por usuário
+    # Limites (diário e por usuário)
     daily_limit = getattr(settings, "recharge_daily_limit", 0.0)
     per_user_limit = getattr(settings, "recharge_per_user_limit", 0.0)
 
@@ -221,6 +282,18 @@ async def msg_recharge_amount(m: Message, state: FSMContext):
             )
             return
 
+    # Horário de funcionamento
+    h_start = getattr(settings, "recharge_hours_start", 0)
+    h_end = getattr(settings, "recharge_hours_end", 24)
+    if h_start > 0 or h_end < 24:
+        now_hour = datetime.utcnow().hour
+        if not (h_start <= now_hour < h_end):
+            await m.answer(
+                f"⏰ As recargas estão disponíveis apenas entre "
+                f"{h_start}h e {h_end}h."
+            )
+            return
+
     bonus = await _calc_bonus(amount)
     await state.clear()
 
@@ -246,7 +319,7 @@ async def _create_pix_charge(target: Message, user_id: int, amount: float, bonus
         await target.answer("⚠️ PIX indisponível no momento.")
         return
 
-    # Criar Payment local primeiro para obter ID
+    # Cria Payment local primeiro para obter ID
     async with AsyncSessionLocal() as s:
         payment = Payment(
             user_id=user_id,
@@ -263,7 +336,7 @@ async def _create_pix_charge(target: Message, user_id: int, amount: float, bonus
         await s.refresh(payment)
         payment_id = payment.id
 
-    # Criar cobrança no MP
+    # Cria no MP
     ext_ref = f"rcg_{payment_id}"
     try:
         mp_resp = await client.create_pix_payment(
@@ -387,7 +460,7 @@ async def cb_recharge_check(cb: CallbackQuery, state: FSMContext):
         return
 
     await cb.answer(
-        "⏳ Ainda não identificamos o pagamento.\n\n"
+        "⏳ PAGAMENTO NÃO IDENTIFICADO\n\n"
         "Se você já pagou, aguarde a atualização bancária (até 2 minutos) "
         "e toque novamente.",
         show_alert=True,
@@ -401,9 +474,6 @@ async def _show_recharge_confirmed(cb: CallbackQuery, payment: Payment, state: F
     async with AsyncSessionLocal() as s:
         w = await s.get(Wallet, payment.user_id)
 
-    credited = payment.credited_amount or round(
-        payment.amount + (payment.bonus_amount or 0), 2
-    )
     new_balance = w.balance if w else 0.0
 
     text = (
