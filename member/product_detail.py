@@ -7,12 +7,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import select, func
 from datetime import datetime, timedelta
+import asyncio
 
 from bot import dp
 from database import AsyncSessionLocal
 from models import (
     Product, User, Wallet, WalletTransaction, Order,
-    CartItem, StockMovement, DeepLinkVisit,
+    CartItem, StockMovement, ProductCredential, OrderDelivery, DeepLinkVisit,
 )
 from settings_cache import get_settings
 
@@ -26,14 +27,45 @@ class BuyStates(StatesGroup):
     waiting_quantity = State()
 
 
+# ============================================================
+# LOCKS E CACHE (anti-duplo + contador de visualização)
+# ============================================================
+_user_locks: dict[int, asyncio.Lock] = {}
+_viewers: dict[int, dict[int, datetime]] = {}
+_VIEW_TTL = timedelta(minutes=5)
+
+
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    lock = _user_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_locks[user_id] = lock
+    return lock
+
+
+def _register_viewer(product_id: int, user_id: int) -> int:
+    now = datetime.utcnow()
+    bucket = _viewers.setdefault(product_id, {})
+    # limpa expirados
+    for uid, ts in list(bucket.items()):
+        if now - ts > _VIEW_TTL:
+            del bucket[uid]
+    bucket[user_id] = now
+    return len(bucket)
+
+
 def _effective_price(p: Product) -> float:
     return p.promo_price if p.promo_price and p.promo_price > 0 else p.price
 
 
-def _mask(text: str) -> str:
-    if not text:
-        return "•••••••••••••••"
-    return "•" * min(len(text), 24)
+def _mask_field(text: str | None) -> str:
+    return "•" * 12 if text else "—"
+
+
+async def _get_balance(user_id: int) -> float:
+    async with AsyncSessionLocal() as s:
+        w = await s.get(Wallet, user_id)
+        return w.balance if w else 0.0
 
 
 # ============================================================
@@ -41,9 +73,9 @@ def _mask(text: str) -> str:
 # ============================================================
 def _personalize_detail_kb(kb: InlineKeyboardMarkup, product_id: int) -> InlineKeyboardMarkup:
     cb_map = {
-        "buy_now":   f"pd_buy_now_{product_id}",
-        "buy_qty":   f"pd_buy_qty_{product_id}",
-        "add_cart":  f"pd_add_cart_{product_id}",
+        "buy_now":       f"pd_buy_now_{product_id}",
+        "buy_qty":       f"pd_buy_qty_{product_id}",
+        "add_cart":      f"pd_add_cart_{product_id}",
         "show_recharge": "show_recharge",
         "show_catalog":  "show_catalog",
     }
@@ -51,9 +83,10 @@ def _personalize_detail_kb(kb: InlineKeyboardMarkup, product_id: int) -> InlineK
     for row in kb.inline_keyboard:
         new_row = []
         for b in row:
-            target_cb = cb_map.get(b.callback_data, b.callback_data)
             new_row.append(InlineKeyboardButton(
-                text=b.text, callback_data=target_cb, url=b.url,
+                text=b.text,
+                callback_data=cb_map.get(b.callback_data, b.callback_data),
+                url=b.url,
             ))
         if new_row:
             new_rows.append(new_row)
@@ -74,6 +107,7 @@ async def _build_detail(product_id: int, user_id: int):
     balance = w.balance if w else 0.0
     username = (u.username if u and u.username else "sem_username")
     display_name = (u.full_name if u and u.full_name else "Cliente")
+    viewers = _register_viewer(product_id, user_id)
 
     variables = {
         "nome_produto": p.name,
@@ -81,7 +115,7 @@ async def _build_detail(product_id: int, user_id: int):
         "saldo": f"{balance:.2f}",
         "estoque": str(p.stock),
         "descricao_produto": (p.description or "Sem descrição")[:300],
-        "quantidade_visualizando": "1",
+        "quantidade_visualizando": str(viewers),
         "nome_usuario": display_name,
         "username": username,
     }
@@ -94,32 +128,20 @@ async def _build_detail(product_id: int, user_id: int):
             f"▸ Preço: R$ {price:.2f}\n"
             f"▸ Seu saldo: R$ {balance:.2f}\n"
             f"▸ Disponibilidade: {p.stock}\n\n"
-            f"⌁ {p.description or 'Sem descrição'}"
+            f"⌁ {p.description or 'Sem descrição'}\n\n"
+            f"◈ {viewers} pessoa(s) visualizando este produto."
         )
 
     if template_kb:
         kb = _personalize_detail_kb(template_kb, product_id)
     else:
-        buttons = []
-        buttons.append([InlineKeyboardButton(
-            text="🛒 Comprar agora",
-            callback_data=f"pd_buy_now_{product_id}",
-        )])
-        buttons.append([InlineKeyboardButton(
-            text="🔢 Comprar quantidade",
-            callback_data=f"pd_buy_qty_{product_id}",
-        )])
-        buttons.append([InlineKeyboardButton(
-            text="🧺 Adicionar ao carrinho",
-            callback_data=f"pd_add_cart_{product_id}",
-        )])
-        buttons.append([InlineKeyboardButton(
-            text="💎 Adicionar saldo", callback_data="show_recharge",
-        )])
-        buttons.append([InlineKeyboardButton(
-            text="↩️ Voltar", callback_data="show_catalog",
-        )])
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Comprar agora", callback_data=f"pd_buy_now_{product_id}")],
+            [InlineKeyboardButton(text="🔢 Comprar quantidade", callback_data=f"pd_buy_qty_{product_id}")],
+            [InlineKeyboardButton(text="🧺 Adicionar ao carrinho", callback_data=f"pd_add_cart_{product_id}")],
+            [InlineKeyboardButton(text="💎 Adicionar saldo", callback_data="show_recharge")],
+            [InlineKeyboardButton(text="↩️ Voltar", callback_data="show_catalog")],
+        ])
 
     if p.stock <= 0 and not allow_oos:
         new_rows = []
@@ -174,6 +196,17 @@ async def _check_buy(product_id: int, user_id: int, quantity: int):
         p = await s.get(Product, product_id)
         w = await s.get(Wallet, user_id)
 
+        # Verificar se o produto usa pool de credenciais
+        cred_count = (await s.execute(
+            select(func.count(ProductCredential.id))
+            .where(ProductCredential.product_id == product_id)
+            .where(ProductCredential.is_sold == False)
+        )).scalar() or 0
+        has_pool = (await s.execute(
+            select(func.count(ProductCredential.id))
+            .where(ProductCredential.product_id == product_id)
+        )).scalar() or 0 > 0
+
     if not p or not p.is_active:
         return False, "Produto indisponível.", {}
 
@@ -182,6 +215,10 @@ async def _check_buy(product_id: int, user_id: int, quantity: int):
 
     if not allow_oos and p.stock < quantity:
         return False, f"Estoque insuficiente (disponível: {p.stock}).", {}
+
+    # Se tem pool de credenciais, exige estoque de credenciais também
+    if has_pool and cred_count < quantity:
+        return False, f"Sem unidades disponíveis para entrega imediata (disponível: {cred_count}).", {}
 
     if quantity < (p.min_per_purchase or 1):
         return False, f"Quantidade mínima: {p.min_per_purchase}.", {}
@@ -206,7 +243,15 @@ async def _check_buy(product_id: int, user_id: int, quantity: int):
     }
 
 
-async def _show_insufficient_balance(target, missing: float, product_id: int):
+async def _show_insufficient_balance(
+    target, missing: float, product_id: int, state: FSMContext,
+    return_ctx: str = "product", quantity: int = 1,
+):
+    await state.update_data(
+        return_ctx=return_ctx,
+        return_product_id=product_id,
+        return_quantity=quantity,
+    )
     text = (
         f"⚠️ SALDO INSUFICIENTE\n\n"
         f"Não foi possível continuar com sua compra.\n\n"
@@ -223,7 +268,8 @@ async def _show_insufficient_balance(target, missing: float, product_id: int):
         await target.answer(text, reply_markup=kb)
 
 
-async def _show_confirmation(target, product_id: int, quantity: int, data: dict):
+async def show_purchase_summary(target, product_id: int, quantity: int, data: dict):
+    """Público: usado também por member/wallet.py ao retornar da recarga."""
     p = data["product"]
     balance = data["balance"]
     total = data["total"]
@@ -263,7 +309,7 @@ async def _show_confirmation(target, product_id: int, quantity: int, data: dict)
 # BUY NOW
 # ============================================================
 @router.callback_query(F.data.startswith("pd_buy_now_"))
-async def cb_buy_now(cb: CallbackQuery):
+async def cb_buy_now(cb: CallbackQuery, state: FSMContext):
     try:
         pid = int(cb.data.replace("pd_buy_now_", ""))
     except (ValueError, TypeError):
@@ -274,13 +320,16 @@ async def cb_buy_now(cb: CallbackQuery):
 
     if not ok:
         if err == "insufficient_balance":
-            await _show_insufficient_balance(cb, data["missing"], pid)
+            await _show_insufficient_balance(
+                cb, data["missing"], pid, state,
+                return_ctx="product", quantity=1,
+            )
             await cb.answer()
         else:
             await cb.answer(err, show_alert=True)
         return
 
-    await _show_confirmation(cb, pid, 1, data)
+    await show_purchase_summary(cb, pid, 1, data)
     await cb.answer()
 
 
@@ -305,19 +354,28 @@ async def cb_buy_qty(cb: CallbackQuery):
     settings = await get_settings()
     allow_oos = getattr(settings, "allow_out_of_stock_sales", False)
     price = _effective_price(p)
+    balance = await _get_balance(cb.from_user.id)
+
+    suggestions = getattr(settings, "quantity_suggestions", None) or [1, 2, 3, 5, 10]
+    try:
+        suggestions = [int(x) for x in suggestions if int(x) > 0]
+    except (TypeError, ValueError):
+        suggestions = [1, 2, 3, 5, 10]
+    if not suggestions:
+        suggestions = [1, 2, 3, 5, 10]
 
     text = (
         f"🔢 COMPRA POR QUANTIDADE\n\n"
         f"📦 Produto: {p.name}\n"
         f"💰 Valor unitário: R$ {price:.2f}\n"
-        f"💎 Seu saldo: R$ {(await _get_balance(cb.from_user.id)):.2f}\n"
+        f"💎 Seu saldo: R$ {balance:.2f}\n"
         f"📦 Disponível: {p.stock}\n\n"
         f"Quantas unidades deseja comprar?"
     )
 
     buttons = []
     row = []
-    for q in (1, 2, 3, 5, 10):
+    for q in suggestions:
         if q <= p.stock or allow_oos:
             row.append(InlineKeyboardButton(
                 text=str(q),
@@ -341,14 +399,8 @@ async def cb_buy_qty(cb: CallbackQuery):
     await cb.answer()
 
 
-async def _get_balance(user_id: int) -> float:
-    async with AsyncSessionLocal() as s:
-        w = await s.get(Wallet, user_id)
-        return w.balance if w else 0.0
-
-
 @router.callback_query(F.data.startswith("pd_qty_pick_"))
-async def cb_qty_pick(cb: CallbackQuery):
+async def cb_qty_pick(cb: CallbackQuery, state: FSMContext):
     rest = cb.data.replace("pd_qty_pick_", "")
     try:
         pid_s, qty_s = rest.rsplit("_", 1)
@@ -362,13 +414,16 @@ async def cb_qty_pick(cb: CallbackQuery):
 
     if not ok:
         if err == "insufficient_balance":
-            await _show_insufficient_balance(cb, data["missing"], pid)
+            await _show_insufficient_balance(
+                cb, data["missing"], pid, state,
+                return_ctx="purchase_summary", quantity=qty,
+            )
             await cb.answer()
         else:
             await cb.answer(err, show_alert=True)
         return
 
-    await _show_confirmation(cb, pid, qty, data)
+    await show_purchase_summary(cb, pid, qty, data)
     await cb.answer()
 
 
@@ -429,12 +484,34 @@ async def msg_quantity_input(m: Message, state: FSMContext):
 
     if not ok:
         if err == "insufficient_balance":
-            await _show_insufficient_balance(m, result["missing"], pid)
+            temp_state = m.bot.__dict__.setdefault("_temp_state", None)  # não usado
+            # Chamamos com um FSMContext fake — usamos o próprio state limpo
+            # Criamos manualmente a tela de saldo insuficiente
+            await _show_insufficient_balance_nostate(
+                m, result["missing"], pid, qty,
+            )
         else:
             await m.answer(f"❌ {err}")
         return
 
-    await _show_confirmation(m, pid, qty, result)
+    await show_purchase_summary(m, pid, qty, result)
+
+
+async def _show_insufficient_balance_nostate(
+    target, missing: float, product_id: int, quantity: int,
+):
+    """Variante sem FSM (chamada de message handler após state.clear())."""
+    text = (
+        f"⚠️ SALDO INSUFICIENTE\n\n"
+        f"Não foi possível continuar com sua compra.\n\n"
+        f"💰 Valor que falta: R$ {missing:.2f}\n\n"
+        f"Adicione saldo à sua carteira e tente novamente."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Adicionar saldo", callback_data="show_recharge")],
+        [InlineKeyboardButton(text="↩️ Voltar", callback_data=f"show_product_{product_id}")],
+    ])
+    await target.answer(text, reply_markup=kb)
 
 
 # ============================================================
@@ -493,14 +570,16 @@ async def cb_add_cart(cb: CallbackQuery):
 
 
 # ============================================================
-# CANCELAR COMPRA
+# CANCELAR
 # ============================================================
 @router.callback_query(F.data.startswith("pd_cancel_"))
-async def cb_cancel_purchase(cb: CallbackQuery):
+async def cb_cancel_purchase(cb: CallbackQuery, state: FSMContext):
     try:
         pid = int(cb.data.replace("pd_cancel_", ""))
     except (ValueError, TypeError):
         pid = 0
+
+    await state.clear()
 
     text = (
         f"❌ COMPRA CANCELADA\n\n"
@@ -519,7 +598,7 @@ async def cb_cancel_purchase(cb: CallbackQuery):
 
 
 # ============================================================
-# EXECUTAR COMPRA (CONFIRMADO)
+# CONFIRMAR COMPRA — PROTEÇÃO ANTI-DUPLO + FOR UPDATE
 # ============================================================
 @router.callback_query(F.data.startswith("pd_confirm_"))
 async def cb_confirm_purchase(cb: CallbackQuery):
@@ -532,24 +611,35 @@ async def cb_confirm_purchase(cb: CallbackQuery):
         await cb.answer("Parâmetros inválidos.", show_alert=True)
         return
 
-    await cb.message.edit_text(
-        "⏳ <b>PROCESSANDO SEU PEDIDO</b>\n\n"
-        "Estamos preparando seus produtos.\n"
-        "Aguarde enquanto o sistema confirma a operação."
-    )
-    await cb.answer()
+    user_id = cb.from_user.id
+    lock = _get_user_lock(user_id)
 
-    try:
-        result = await _execute_purchase(cb.from_user.id, pid, qty)
-    except Exception as e:
-        await cb.message.edit_text(
-            f"❌ ERRO AO PROCESSAR\n\n<code>{str(e)[:200]}</code>\n\n"
-            f"Entre em contato com o suporte informando o ocorrido.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 Menu principal", callback_data="main_menu")],
-            ]),
+    if lock.locked():
+        await cb.answer(
+            "⏳ Sua compra anterior ainda está sendo processada. Aguarde.",
+            show_alert=True,
         )
         return
+
+    async with lock:
+        await cb.message.edit_text(
+            "⏳ <b>PROCESSANDO SEU PEDIDO</b>\n\n"
+            "Estamos preparando seus produtos.\n"
+            "Aguarde..."
+        )
+        await cb.answer()
+
+        try:
+            result = await _execute_purchase(user_id, pid, qty)
+        except Exception as e:
+            await cb.message.edit_text(
+                f"❌ ERRO AO PROCESSAR\n\n<code>{str(e)[:200]}</code>\n\n"
+                f"Entre em contato com o suporte informando o ocorrido.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🏠 Menu principal", callback_data="main_menu")],
+                ]),
+            )
+            return
 
     if not result["ok"]:
         await cb.message.edit_text(
@@ -564,37 +654,66 @@ async def cb_confirm_purchase(cb: CallbackQuery):
     await _show_delivery(cb, result)
 
 
+# ============================================================
+# EXECUÇÃO ATÔMICA
+# ============================================================
 async def _execute_purchase(user_id: int, product_id: int, quantity: int) -> dict:
     async with AsyncSessionLocal() as s:
-        p = await s.get(Product, product_id)
-        w = await s.get(Wallet, user_id)
+        # SELECT FOR UPDATE garante atomicidade em cliques simultâneos
+        product_row = (await s.execute(
+            select(Product).where(Product.id == product_id).with_for_update()
+        )).scalar_one_or_none()
+        wallet_row = (await s.execute(
+            select(Wallet).where(Wallet.user_id == user_id).with_for_update()
+        )).scalar_one_or_none()
 
-        if not p or not p.is_active:
+        if not product_row or not product_row.is_active:
             return {"ok": False, "error": "Produto indisponível."}
 
         settings = await get_settings()
         allow_oos = getattr(settings, "allow_out_of_stock_sales", False)
 
-        if not allow_oos and p.stock < quantity:
-            return {"ok": False, "error": f"Estoque insuficiente (disponível: {p.stock})."}
+        if not allow_oos and product_row.stock < quantity:
+            return {"ok": False, "error": f"Estoque insuficiente (disponível: {product_row.stock})."}
 
-        price = _effective_price(p)
+        # Pool de credenciais
+        has_pool = (await s.execute(
+            select(func.count(ProductCredential.id))
+            .where(ProductCredential.product_id == product_id)
+        )).scalar() or 0 > 0
+
+        credentials = []
+        if has_pool:
+            creds = (await s.execute(
+                select(ProductCredential)
+                .where(ProductCredential.product_id == product_id)
+                .where(ProductCredential.is_sold == False)
+                .order_by(ProductCredential.id)
+                .limit(quantity)
+                .with_for_update()
+            )).scalars().all()
+            if len(creds) < quantity:
+                return {"ok": False, "error": "Sem unidades disponíveis para entrega."}
+            credentials = creds
+
+        price = _effective_price(product_row)
         total = round(price * quantity, 2)
 
-        if not w:
-            w = Wallet(user_id=user_id, balance=0.0)
-            s.add(w)
+        if not wallet_row:
+            wallet_row = Wallet(user_id=user_id, balance=0.0)
+            s.add(wallet_row)
+            await s.flush()
 
-        if w.balance < total:
+        if wallet_row.balance < total:
             return {"ok": False, "error": "Saldo insuficiente."}
 
-        before = w.balance
-        w.balance = round(w.balance - total, 2)
-        after = w.balance
+        before = wallet_row.balance
+        wallet_row.balance = round(wallet_row.balance - total, 2)
+        after = wallet_row.balance
 
-        stock_before = p.stock
-        p.stock -= quantity
-        p.sold_count += quantity
+        stock_before = product_row.stock
+        product_row.stock -= quantity
+        product_row.sold_count += quantity
 
         order = Order(
             user_id=user_id,
@@ -604,19 +723,45 @@ async def _execute_purchase(user_id: int, product_id: int, quantity: int) -> dic
             status="completed",
             payment_method="wallet",
             delivery_data={
-                "info": p.delivery_info or "",
-                "activation_link": p.activation_link or "",
+                "info": product_row.delivery_info or "",
+                "activation_link": product_row.activation_link or "",
             },
+            processed_at=datetime.utcnow(),
         )
         s.add(order)
         await s.flush()
         order_id = order.id
 
+        # Cria OrderDelivery por unidade
+        deliveries = []
+        for i in range(quantity):
+            cred = credentials[i] if i < len(credentials) else None
+            if cred:
+                cred.is_sold = True
+                cred.sold_at = datetime.utcnow()
+                cred.order_id = order_id
+                s.add(OrderDelivery(
+                    order_id=order_id,
+                    product_id=product_id,
+                    credential_id=cred.id,
+                    email=cred.email,
+                    password=cred.password,
+                    extra_data=cred.extra_data,
+                ))
+            else:
+                s.add(OrderDelivery(
+                    order_id=order_id,
+                    product_id=product_id,
+                    email=None,
+                    password=None,
+                    extra_data={"info": product_row.delivery_info or ""},
+                ))
+
         s.add(WalletTransaction(
             user_id=user_id,
             amount=-total,
             type="purchase",
-            description=f"Compra #{order_id} - {p.name} x{quantity}",
+            description=f"Compra #{order_id} - {product_row.name} x{quantity}",
             balance_before=before,
             balance_after=after,
         ))
@@ -627,7 +772,7 @@ async def _execute_purchase(user_id: int, product_id: int, quantity: int) -> dic
             movement_type="sale",
             quantity=quantity,
             stock_before=stock_before,
-            stock_after=p.stock,
+            stock_after=product_row.stock,
             reason=f"Venda pelo bot - pedido #{order_id}",
         ))
 
@@ -636,19 +781,20 @@ async def _execute_purchase(user_id: int, product_id: int, quantity: int) -> dic
         result = {
             "ok": True,
             "order_id": order_id,
-            "product_name": p.name,
+            "product_name": product_row.name,
             "product_id": product_id,
             "quantity": quantity,
             "total": total,
             "new_balance": after,
             "created_at": order.created_at,
             "delivery": {
-                "info": p.delivery_info or "",
-                "activation_link": p.activation_link or "",
+                "info": product_row.delivery_info or "",
+                "activation_link": product_row.activation_link or "",
             },
+            "has_individual_credentials": has_pool,
         }
 
-    # Efeitos colaterais (não bloqueiam a compra se falharem)
+    # Efeitos colaterais
     try:
         from admin.channels import publish_purchase_announcement
         await publish_purchase_announcement(order_id)
@@ -700,26 +846,60 @@ async def _execute_purchase(user_id: int, product_id: int, quantity: int) -> dic
 # TELA DE ENTREGA
 # ============================================================
 async def _show_delivery(target, result: dict):
-    info = result["delivery"].get("info", "") or "Consulte o suporte para receber seus dados."
+    order_id = result["order_id"]
     activation = result["delivery"].get("activation_link", "") or ""
+    has_individual = result.get("has_individual_credentials", False)
 
-    text = (
-        f"✅ <b>COMPRA CONCLUÍDA!</b>\n\n"
-        f"Seu pedido foi confirmado e seus dados de acesso estão disponíveis.\n\n"
-        f"━━━━━━━━━━━━━━\n\n"
-        f"📦 Produto: {result['product_name']}\n"
-        f"🆔 Pedido: #{result['order_id']}\n"
-        f"📅 Data: {result['created_at'].strftime('%d/%m/%Y %H:%M')}\n\n"
-        f"🔐 <b>DADOS DE ACESSO</b>\n\n"
-        f"{_mask(info)}\n\n"
-        f"━━━━━━━━━━━━━━\n\n"
-        f"💡 Seus dados estão protegidos. Use os botões abaixo para visualizar."
-    )
+    if has_individual:
+        # Busca deliveries individuais
+        async with AsyncSessionLocal() as s:
+            deliveries = (await s.execute(
+                select(OrderDelivery)
+                .where(OrderDelivery.order_id == order_id)
+                .order_by(OrderDelivery.id)
+            )).scalars().all()
+
+        lines = []
+        for i, d in enumerate(deliveries, 1):
+            lines.append(
+                f"<b>Acesso #{i}</b>\n"
+                f"📧 E-mail: {_mask_field(d.email)}\n"
+                f"🔑 Senha: {_mask_field(d.password)}"
+            )
+
+        text = (
+            f"✅ <b>COMPRA CONCLUÍDA!</b>\n\n"
+            f"Seu pedido foi confirmado e seus dados de acesso estão disponíveis.\n\n"
+            f"━━━━━━━━━━━━━━\n\n"
+            f"📦 Produto: {result['product_name']}\n"
+            f"🆔 Pedido: #{order_id}\n"
+            f"📅 Data: {result['created_at'].strftime('%d/%m/%Y %H:%M')}\n"
+            f"🔢 Quantidade: {result['quantity']}\n"
+            f"💰 Total pago: R$ {result['total']:.2f}\n\n"
+            f"🔐 <b>DADOS DE ACESSO</b>\n\n"
+            + "\n\n".join(lines)
+            + f"\n\n━━━━━━━━━━━━━━\n\n"
+            f"💡 Seus dados estão protegidos. Use os botões abaixo para visualizar."
+        )
+    else:
+        info = result["delivery"].get("info", "") or "Consulte o suporte para receber seus dados."
+        text = (
+            f"✅ <b>COMPRA CONCLUÍDA!</b>\n\n"
+            f"Seu pedido foi confirmado e seus dados de acesso estão disponíveis.\n\n"
+            f"━━━━━━━━━━━━━━\n\n"
+            f"📦 Produto: {result['product_name']}\n"
+            f"🆔 Pedido: #{order_id}\n"
+            f"📅 Data: {result['created_at'].strftime('%d/%m/%Y %H:%M')}\n\n"
+            f"🔐 <b>DADOS DE ACESSO</b>\n\n"
+            f"📧 E-mail: {_mask_field(info)}\n\n"
+            f"━━━━━━━━━━━━━━\n\n"
+            f"💡 Seus dados estão protegidos. Use os botões abaixo para visualizar."
+        )
 
     buttons = [
         [InlineKeyboardButton(
             text="🔓 Ativar visualização",
-            callback_data=f"pd_show_creds_{result['order_id']}",
+            callback_data=f"pd_show_creds_{order_id}",
         )],
     ]
     if activation:
@@ -740,7 +920,7 @@ async def _show_delivery(target, result: dict):
 
 
 # ============================================================
-# TOGGLE DE CREDENCIAIS
+# TOGGLE CREDENCIAIS
 # ============================================================
 @router.callback_query(F.data.startswith("pd_show_creds_"))
 async def cb_toggle_show_creds(cb: CallbackQuery):
@@ -757,26 +937,58 @@ async def cb_toggle_show_creds(cb: CallbackQuery):
             return
         p = await s.get(Product, order.product_id)
 
-    delivery = order.delivery_data or {}
-    info = delivery.get("info", "") or "Consulte o suporte."
-    activation = delivery.get("activation_link", "") or ""
+        deliveries = (await s.execute(
+            select(OrderDelivery).where(OrderDelivery.order_id == oid).order_by(OrderDelivery.id)
+        )).scalars().all()
 
-    text = (
-        f"✅ <b>COMPRA CONCLUÍDA!</b>\n\n"
-        f"━━━━━━━━━━━━━━\n\n"
-        f"📦 Produto: {p.name if p else '—'}\n"
-        f"🆔 Pedido: #{oid}\n"
-        f"📅 Data: {order.created_at.strftime('%d/%m/%Y %H:%M')}\n\n"
-        f"🔐 <b>DADOS DE ACESSO</b>\n\n"
-        f"<code>{info}</code>\n\n"
-        f"━━━━━━━━━━━━━━"
-    )
+    has_individual = len(deliveries) > 0 and any(d.email or d.password for d in deliveries)
 
+    if has_individual:
+        lines = []
+        for i, d in enumerate(deliveries, 1):
+            if d.is_revoked:
+                lines.append(f"<b>Acesso #{i}</b> — ❌ revogado")
+                continue
+            email = d.email or "—"
+            pwd = d.password or "—"
+            extra = ""
+            if d.extra_data and isinstance(d.extra_data, dict):
+                for k, v in d.extra_data.items():
+                    if k != "info":
+                        extra += f"\n   {k}: <code>{v}</code>"
+            lines.append(
+                f"<b>Acesso #{i}</b>\n"
+                f"📧 E-mail: <code>{email}</code>\n"
+                f"🔑 Senha: <code>{pwd}</code>{extra}"
+            )
+
+        text = (
+            f"✅ <b>COMPRA CONCLUÍDA!</b>\n\n"
+            f"━━━━━━━━━━━━━━\n\n"
+            f"📦 Produto: {p.name if p else '—'}\n"
+            f"🆔 Pedido: #{oid}\n"
+            f"📅 Data: {order.created_at.strftime('%d/%m/%Y %H:%M')}\n\n"
+            f"🔐 <b>SEUS ACESSOS</b>\n\n"
+            + "\n\n".join(lines)
+            + f"\n\n━━━━━━━━━━━━━━"
+        )
+    else:
+        delivery = order.delivery_data or {}
+        info = delivery.get("info", "") or "Consulte o suporte."
+        text = (
+            f"✅ <b>COMPRA CONCLUÍDA!</b>\n\n"
+            f"━━━━━━━━━━━━━━\n\n"
+            f"📦 Produto: {p.name if p else '—'}\n"
+            f"🆔 Pedido: #{oid}\n"
+            f"📅 Data: {order.created_at.strftime('%d/%m/%Y %H:%M')}\n\n"
+            f"🔐 <b>DADOS DE ACESSO</b>\n\n"
+            f"<code>{info}</code>\n\n"
+            f"━━━━━━━━━━━━━━"
+        )
+
+    activation = (order.delivery_data or {}).get("activation_link", "")
     buttons = [
-        [InlineKeyboardButton(
-            text="🔒 Ocultar dados",
-            callback_data=f"pd_hide_creds_{oid}",
-        )],
+        [InlineKeyboardButton(text="🔒 Ocultar dados", callback_data=f"pd_hide_creds_{oid}")],
     ]
     if activation:
         buttons.append([InlineKeyboardButton(text="🌐 Ativar diretamente", url=activation)])
@@ -801,26 +1013,46 @@ async def cb_toggle_hide_creds(cb: CallbackQuery):
             return
         p = await s.get(Product, order.product_id)
 
-    delivery = order.delivery_data or {}
-    info = delivery.get("info", "") or ""
-    activation = delivery.get("activation_link", "") or ""
+        deliveries = (await s.execute(
+            select(OrderDelivery).where(OrderDelivery.order_id == oid).order_by(OrderDelivery.id)
+        )).scalars().all()
 
-    text = (
-        f"✅ <b>COMPRA CONCLUÍDA!</b>\n\n"
-        f"━━━━━━━━━━━━━━\n\n"
-        f"📦 Produto: {p.name if p else '—'}\n"
-        f"🆔 Pedido: #{oid}\n"
-        f"📅 Data: {order.created_at.strftime('%d/%m/%Y %H:%M')}\n\n"
-        f"🔐 <b>DADOS DE ACESSO</b>\n\n"
-        f"{_mask(info)}\n\n"
-        f"━━━━━━━━━━━━━━"
-    )
+    has_individual = len(deliveries) > 0 and any(d.email or d.password for d in deliveries)
 
+    if has_individual:
+        lines = []
+        for i, d in enumerate(deliveries, 1):
+            lines.append(
+                f"<b>Acesso #{i}</b>\n"
+                f"📧 E-mail: {_mask_field(d.email)}\n"
+                f"🔑 Senha: {_mask_field(d.password)}"
+            )
+        text = (
+            f"✅ <b>COMPRA CONCLUÍDA!</b>\n\n"
+            f"━━━━━━━━━━━━━━\n\n"
+            f"📦 Produto: {p.name if p else '—'}\n"
+            f"🆔 Pedido: #{oid}\n"
+            f"📅 Data: {order.created_at.strftime('%d/%m/%Y %H:%M')}\n\n"
+            f"🔐 <b>SEUS ACESSOS</b>\n\n"
+            + "\n\n".join(lines)
+            + f"\n\n━━━━━━━━━━━━━━"
+        )
+    else:
+        info = (order.delivery_data or {}).get("info", "") or ""
+        text = (
+            f"✅ <b>COMPRA CONCLUÍDA!</b>\n\n"
+            f"━━━━━━━━━━━━━━\n\n"
+            f"📦 Produto: {p.name if p else '—'}\n"
+            f"🆔 Pedido: #{oid}\n"
+            f"📅 Data: {order.created_at.strftime('%d/%m/%Y %H:%M')}\n\n"
+            f"🔐 <b>DADOS DE ACESSO</b>\n\n"
+            f"📧 E-mail: {_mask_field(info)}\n\n"
+            f"━━━━━━━━━━━━━━"
+        )
+
+    activation = (order.delivery_data or {}).get("activation_link", "")
     buttons = [
-        [InlineKeyboardButton(
-            text="🔓 Ativar visualização",
-            callback_data=f"pd_show_creds_{oid}",
-        )],
+        [InlineKeyboardButton(text="🔓 Ativar visualização", callback_data=f"pd_show_creds_{oid}")],
     ]
     if activation:
         buttons.append([InlineKeyboardButton(text="🌐 Ativar diretamente", url=activation)])
