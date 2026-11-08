@@ -1,6 +1,7 @@
 from aiogram import Router, F
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ChatMemberUpdated,
 )
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select, func
@@ -20,6 +21,27 @@ from admin.affiliates import process_referral_on_start
 
 router = Router()
 dp.include_router(router)
+
+
+# ============================================================
+# TRACKING DA MENSAGEM DE BLOQUEIO
+# ============================================================
+# Guarda o message_id da última tela de bloqueio enviada por usuário.
+# Permite editar essa mensagem automaticamente quando o usuário
+# entrar no canal/grupo obrigatório (evento chat_member).
+_last_block_msg: dict[int, int] = {}
+
+
+def _store_block_msg(user_id: int, message_id: int):
+    _last_block_msg[user_id] = message_id
+
+
+def _get_block_msg(user_id: int) -> int | None:
+    return _last_block_msg.get(user_id)
+
+
+def _clear_block_msg(user_id: int):
+    _last_block_msg.pop(user_id, None)
 
 
 # ============================================================
@@ -76,6 +98,17 @@ async def _cart_count(user_id: int) -> int:
         )).scalar() or 0
 
 
+async def _check_single_chat(chat_id: str | None, user_id: int) -> bool:
+    """Verifica se o usuário está em UM canal/grupo específico."""
+    if not chat_id:
+        return True
+    try:
+        m = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        return m.status in ("creator", "administrator", "member", "restricted")
+    except Exception:
+        return False
+
+
 async def _check_membership(user_id: int) -> tuple[bool, bool, bool]:
     """
     Retorna (channel_ok, group_ok, needs_check).
@@ -88,23 +121,8 @@ async def _check_membership(user_id: int) -> tuple[bool, bool, bool]:
     if not ch_id and not gr_id:
         return True, True, False
 
-    channel_ok = True
-    group_ok = True
-
-    if ch_id:
-        try:
-            m = await bot.get_chat_member(chat_id=ch_id, user_id=user_id)
-            channel_ok = m.status in ("creator", "administrator", "member", "restricted")
-        except Exception:
-            channel_ok = False
-
-    if gr_id:
-        try:
-            m = await bot.get_chat_member(chat_id=gr_id, user_id=user_id)
-            group_ok = m.status in ("creator", "administrator", "member", "restricted")
-        except Exception:
-            group_ok = False
-
+    channel_ok = await _check_single_chat(ch_id, user_id)
+    group_ok = await _check_single_chat(gr_id, user_id)
     return channel_ok, group_ok, True
 
 
@@ -190,7 +208,10 @@ async def _send_welcome(message_or_cb, edit: bool = False):
     await msg.answer(text, reply_markup=kb)
 
 
-async def _send_block_screen(target, edit: bool = False):
+# ============================================================
+# BLOQUEIO — construção e envio
+# ============================================================
+async def _build_block_content() -> tuple[str, InlineKeyboardMarkup]:
     settings = await get_settings()
     ch_id = getattr(settings, "mandatory_channel_id", None)
     gr_id = getattr(settings, "mandatory_group_id", None)
@@ -220,7 +241,9 @@ async def _send_block_screen(target, edit: bool = False):
         "🔒 <b>ACESSO RESTRITO</b>\n\n"
         "Para utilizar nossos serviços, é necessário participar do nosso "
         "grupo e canal oficial.\n\n"
-        "Após entrar em <b>ambos</b>, toque em <b>Verificar participação</b> para continuar."
+        "Após entrar em <b>ambos</b>, toque em <b>Verificar participação</b> "
+        "para continuar.\n\n"
+        "💡 <i>Verificamos automaticamente assim que você entrar.</i>"
     )
 
     buttons = []
@@ -232,17 +255,77 @@ async def _send_block_screen(target, edit: bool = False):
         InlineKeyboardButton(text="✅ Já entrei, verificar", callback_data="member_verify")
     ])
 
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _send_block_screen(target, edit: bool = False):
+    text, kb = await _build_block_content()
 
     if isinstance(target, CallbackQuery):
         try:
             await target.message.edit_text(text, reply_markup=kb)
+            _store_block_msg(target.from_user.id, target.message.message_id)
             return
         except Exception:
-            await target.message.answer(text, reply_markup=kb)
+            sent = await target.message.answer(text, reply_markup=kb)
+            _store_block_msg(target.from_user.id, sent.message_id)
             return
 
-    await target.answer(text, reply_markup=kb)
+    sent = await target.answer(text, reply_markup=kb)
+    _store_block_msg(target.from_user.id, sent.message_id)
+
+
+async def _send_block_to_user(user_id: int):
+    """Envia o bloqueio diretamente por user_id (usado quando o usuário sai do canal/grupo)."""
+    text, kb = await _build_block_content()
+    try:
+        sent = await bot.send_message(chat_id=user_id, text=text, reply_markup=kb)
+        _store_block_msg(user_id, sent.message_id)
+    except Exception as e:
+        print(f"[membership] erro ao enviar block para {user_id}: {e}")
+
+
+async def _send_unblocked_menu(user_id: int):
+    """
+    Desbloqueia o usuário: edita a mensagem de bloqueio existente ou envia
+    o menu principal. Chamado quando o usuário entra no canal/grupo (chat_member).
+    """
+    text, kb, image_url = await _build_welcome_message(user_id)
+    block_msg_id = _get_block_msg(user_id)
+
+    # Caso 1: texto → texto, edita a mensagem de bloqueio
+    if block_msg_id and not image_url:
+        try:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=block_msg_id,
+                text=text,
+                reply_markup=kb,
+            )
+            _clear_block_msg(user_id)
+            return
+        except Exception:
+            pass  # fallback abaixo
+
+    # Caso 2: precisa recriar a mensagem (imagem ou edição falhou)
+    if block_msg_id:
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=block_msg_id)
+        except Exception:
+            pass
+
+    try:
+        if image_url:
+            await bot.send_photo(
+                chat_id=user_id, photo=image_url,
+                caption=text, reply_markup=kb,
+            )
+        else:
+            await bot.send_message(chat_id=user_id, text=text, reply_markup=kb)
+    except Exception as e:
+        print(f"[membership] erro ao enviar menu para {user_id}: {e}")
+
+    _clear_block_msg(user_id)
 
 
 # ============================================================
@@ -292,17 +375,20 @@ async def cmd_start(message: Message, state: FSMContext):
             await _send_block_screen(message)
             return
 
+    # Já passou — limpa qualquer tracking antigo
+    _clear_block_msg(user.id)
     await _send_welcome(message, edit=False)
 
 
 # ============================================================
-# Verificação de participação (tela de bloqueio)
+# VERIFICAÇÃO MANUAL (botão "Já entrei, verificar")
 # ============================================================
 @router.callback_query(F.data == "member_verify")
 async def cb_verify_membership(cb: CallbackQuery):
     user_id = cb.from_user.id
 
     if user_id in ADMIN_IDS:
+        _clear_block_msg(user_id)
         await _send_welcome(cb, edit=True)
         await cb.answer("✅ Acesso liberado.")
         return
@@ -310,6 +396,7 @@ async def cb_verify_membership(cb: CallbackQuery):
     channel_ok, group_ok, needs_check = await _check_membership(user_id)
 
     if not needs_check or (channel_ok and group_ok):
+        _clear_block_msg(user_id)
         await _send_welcome(cb, edit=True)
         await cb.answer("✅ Verificado! Acesso liberado.")
         return
@@ -328,7 +415,73 @@ async def cb_verify_membership(cb: CallbackQuery):
 
 
 # ============================================================
-# Menu principal (retorno)
+# VERIFICAÇÃO AUTOMÁTICA (chat_member event)
+# ============================================================
+@router.chat_member()
+async def on_chat_member_updated(event: ChatMemberUpdated):
+    """
+    Detecta entrada/saída do usuário no canal/grupo obrigatório
+    e age automaticamente (§2.3 e §2.4).
+    """
+    settings = await get_settings()
+
+    if not getattr(settings, "bot_enabled", True):
+        return
+    if getattr(settings, "maintenance_mode", False):
+        return
+
+    mandatory_channel = getattr(settings, "mandatory_channel_id", None)
+    mandatory_group = getattr(settings, "mandatory_group_id", None)
+    if not mandatory_channel and not mandatory_group:
+        return
+
+    chat_id_str = str(event.chat.id)
+    is_channel = (chat_id_str == str(mandatory_channel)) if mandatory_channel else False
+    is_group = (chat_id_str == str(mandatory_group)) if mandatory_group else False
+    if not (is_channel or is_group):
+        return
+
+    user = event.from_user
+    if not user or user.is_bot:
+        return
+    if user.id in ADMIN_IDS:
+        return
+
+    # Só age em usuários que já interagiram com o bot
+    async with AsyncSessionLocal() as s:
+        db_user = await s.get(User, user.id)
+    if not db_user:
+        return
+
+    new_status = event.new_chat_member.status
+    joined = ("member", "administrator", "creator", "restricted")
+    left = ("left", "kicked")
+
+    if new_status in joined:
+        # Confia no evento para ESTE chat, re-checa o outro
+        if is_channel:
+            channel_ok = True
+            group_ok = await _check_single_chat(mandatory_group, user.id) if mandatory_group else True
+        else:
+            group_ok = True
+            channel_ok = await _check_single_chat(mandatory_channel, user.id) if mandatory_channel else True
+
+        if channel_ok and group_ok and _get_block_msg(user.id) is not None:
+            await _send_unblocked_menu(user.id)
+        return
+
+    if new_status in left:
+        # Saiu de um canal/grupo obrigatório — verifica se ainda cumpre tudo
+        channel_ok = await _check_single_chat(mandatory_channel, user.id) if mandatory_channel else True
+        group_ok = await _check_single_chat(mandatory_group, user.id) if mandatory_group else True
+
+        if not (channel_ok and group_ok):
+            await _send_block_to_user(user.id)
+        return
+
+
+# ============================================================
+# RETORNO AO MENU
 # ============================================================
 @router.callback_query(F.data.in_({"main_menu", "nav_main"}))
 async def cb_main_menu(cb: CallbackQuery, state: FSMContext):
