@@ -16,7 +16,6 @@ from settings_cache import get_settings
 from admin.customization import (
     get_rendered_message, get_rendered_image, get_or_create_template,
 )
-from settings_cache import get_settings, get_greeting
 from admin.deeplinks import register_deeplink_visit
 from admin.affiliates import process_referral_on_start
 
@@ -25,11 +24,38 @@ dp.include_router(router)
 
 
 # ============================================================
+# SAUDAÇÃO — autocontida, sem dependência de get_greeting externo
+# ============================================================
+async def _get_greeting() -> str:
+    """
+    Lê as faixas e textos de saudação do BotSettings via getattr,
+    com fallback seguro caso as colunas ainda não existam no banco.
+    """
+    s = await get_settings()
+    h = datetime.now().hour
+
+    m_start = getattr(s, "greeting_morning_start", 5) or 0
+    m_end = getattr(s, "greeting_morning_end", 12) or 12
+    a_start = getattr(s, "greeting_afternoon_start", 12) or 12
+    a_end = getattr(s, "greeting_afternoon_end", 18) or 18
+
+    if not (0 <= m_start < m_end <= 24 and 0 <= a_start < a_end <= 24):
+        m_start, m_end = 5, 12
+        a_start, a_end = 12, 18
+
+    if m_start <= h < m_end:
+        text = (getattr(s, "greeting_morning_text", "") or "").strip()
+        return text if text else "Bom dia"
+    if a_start <= h < a_end:
+        text = (getattr(s, "greeting_afternoon_text", "") or "").strip()
+        return text if text else "Boa tarde"
+    text = (getattr(s, "greeting_night_text", "") or "").strip()
+    return text if text else "Boa noite"
+
+
+# ============================================================
 # TRACKING DA MENSAGEM DE BLOQUEIO
 # ============================================================
-# Guarda o message_id da última tela de bloqueio enviada por usuário.
-# Permite editar essa mensagem automaticamente quando o usuário
-# entrar no canal/grupo obrigatório (evento chat_member).
 _last_block_msg: dict[int, int] = {}
 
 
@@ -91,7 +117,6 @@ async def _cart_count(user_id: int) -> int:
 
 
 async def _check_single_chat(chat_id: str | None, user_id: int) -> bool:
-    """Verifica se o usuário está em UM canal/grupo específico."""
     if not chat_id:
         return True
     try:
@@ -102,10 +127,6 @@ async def _check_single_chat(chat_id: str | None, user_id: int) -> bool:
 
 
 async def _check_membership(user_id: int) -> tuple[bool, bool, bool]:
-    """
-    Retorna (channel_ok, group_ok, needs_check).
-    needs_check=False quando nenhum canal/grupo obrigatório está configurado.
-    """
     settings = await get_settings()
     ch_id = getattr(settings, "mandatory_channel_id", None)
     gr_id = getattr(settings, "mandatory_group_id", None)
@@ -134,7 +155,6 @@ def _filter_button(
 async def _build_welcome_message(
     user_id: int,
 ) -> tuple[str, InlineKeyboardMarkup | None, str | None]:
-    """Retorna (texto, teclado, image_url) do menu principal."""
     await get_or_create_template("welcome")
 
     async with AsyncSessionLocal() as s:
@@ -142,19 +162,19 @@ async def _build_welcome_message(
         w = await s.get(Wallet, user_id)
 
     balance = w.balance if w else 0.0
-    greeting = await get_greeting()
-    nome = (u.full_name if u and u.full_name else "Cliente")
 
-    text, kb = await get_rendered_message("welcome", {
-        "saudacao": greeting,   # ← agora lê do banco
-        "nome_usuario": nome,
+    variables = {
+        "saudacao": await _get_greeting(),   # ← função local, não depende de settings_cache
+        "nome_usuario": (u.full_name if u and u.full_name else "Cliente"),
         "username": (u.username if u and u.username else "sem_username"),
         "telegram_id": str(user_id),
         "saldo": f"{balance:.2f}",
-    })
+    }
+
+    text, kb = await get_rendered_message("welcome", variables)
     if not text:
         text = (
-            f"☀️ {greeting}, {nome}!\n\n"
+            f"☀️ {variables['saudacao']}, {variables['nome_usuario']}!\n\n"
             f"💠 BELLAMY | DIGITAL STORE\n\n"
             f"👇 Selecione uma opção no menu."
         )
@@ -202,7 +222,7 @@ async def _send_welcome(message_or_cb, edit: bool = False):
 
 
 # ============================================================
-# BLOQUEIO — construção e envio
+# BLOQUEIO
 # ============================================================
 async def _build_block_content() -> tuple[str, InlineKeyboardMarkup]:
     settings = await get_settings()
@@ -269,7 +289,6 @@ async def _send_block_screen(target, edit: bool = False):
 
 
 async def _send_block_to_user(user_id: int):
-    """Envia o bloqueio diretamente por user_id (usado quando o usuário sai do canal/grupo)."""
     text, kb = await _build_block_content()
     try:
         sent = await bot.send_message(chat_id=user_id, text=text, reply_markup=kb)
@@ -279,14 +298,9 @@ async def _send_block_to_user(user_id: int):
 
 
 async def _send_unblocked_menu(user_id: int):
-    """
-    Desbloqueia o usuário: edita a mensagem de bloqueio existente ou envia
-    o menu principal. Chamado quando o usuário entra no canal/grupo (chat_member).
-    """
     text, kb, image_url = await _build_welcome_message(user_id)
     block_msg_id = _get_block_msg(user_id)
 
-    # Caso 1: texto → texto, edita a mensagem de bloqueio
     if block_msg_id and not image_url:
         try:
             await bot.edit_message_text(
@@ -298,9 +312,8 @@ async def _send_unblocked_menu(user_id: int):
             _clear_block_msg(user_id)
             return
         except Exception:
-            pass  # fallback abaixo
+            pass
 
-    # Caso 2: precisa recriar a mensagem (imagem ou edição falhou)
     if block_msg_id:
         try:
             await bot.delete_message(chat_id=user_id, message_id=block_msg_id)
@@ -322,7 +335,7 @@ async def _send_unblocked_menu(user_id: int):
 
 
 # ============================================================
-# /start — entrada principal
+# /start
 # ============================================================
 @router.message(F.text.startswith("/start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -368,13 +381,12 @@ async def cmd_start(message: Message, state: FSMContext):
             await _send_block_screen(message)
             return
 
-    # Já passou — limpa qualquer tracking antigo
     _clear_block_msg(user.id)
     await _send_welcome(message, edit=False)
 
 
 # ============================================================
-# VERIFICAÇÃO MANUAL (botão "Já entrei, verificar")
+# VERIFICAÇÃO MANUAL
 # ============================================================
 @router.callback_query(F.data == "member_verify")
 async def cb_verify_membership(cb: CallbackQuery):
@@ -408,14 +420,10 @@ async def cb_verify_membership(cb: CallbackQuery):
 
 
 # ============================================================
-# VERIFICAÇÃO AUTOMÁTICA (chat_member event)
+# VERIFICAÇÃO AUTOMÁTICA
 # ============================================================
 @router.chat_member()
 async def on_chat_member_updated(event: ChatMemberUpdated):
-    """
-    Detecta entrada/saída do usuário no canal/grupo obrigatório
-    e age automaticamente (§2.3 e §2.4).
-    """
     settings = await get_settings()
 
     if not getattr(settings, "bot_enabled", True):
@@ -440,7 +448,6 @@ async def on_chat_member_updated(event: ChatMemberUpdated):
     if user.id in ADMIN_IDS:
         return
 
-    # Só age em usuários que já interagiram com o bot
     async with AsyncSessionLocal() as s:
         db_user = await s.get(User, user.id)
     if not db_user:
@@ -451,7 +458,6 @@ async def on_chat_member_updated(event: ChatMemberUpdated):
     left = ("left", "kicked")
 
     if new_status in joined:
-        # Confia no evento para ESTE chat, re-checa o outro
         if is_channel:
             channel_ok = True
             group_ok = await _check_single_chat(mandatory_group, user.id) if mandatory_group else True
@@ -464,7 +470,6 @@ async def on_chat_member_updated(event: ChatMemberUpdated):
         return
 
     if new_status in left:
-        # Saiu de um canal/grupo obrigatório — verifica se ainda cumpre tudo
         channel_ok = await _check_single_chat(mandatory_channel, user.id) if mandatory_channel else True
         group_ok = await _check_single_chat(mandatory_group, user.id) if mandatory_group else True
 
