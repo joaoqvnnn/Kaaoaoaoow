@@ -21,6 +21,16 @@ class SettingsStates(StatesGroup):
     waiting_block_reason = State()
     waiting_block_duration = State()
 
+
+class GreetingStates(StatesGroup):
+    waiting_morning_start = State()
+    waiting_morning_end = State()
+    waiting_afternoon_start = State()
+    waiting_afternoon_end = State()
+    waiting_morning_text = State()
+    waiting_afternoon_text = State()
+    waiting_night_text = State()
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -38,6 +48,7 @@ def settings_menu_keyboard(s: BotSettings) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"🛠️ Manutenção: {maint_status}", callback_data="cfg_toggle_maintenance")],
         [InlineKeyboardButton(text="📝 Editar mensagem de manutenção", callback_data="cfg_edit_maintenance_msg")],
         [InlineKeyboardButton(text="🔗 Configurar link de suporte", callback_data="cfg_edit_support_url")],
+        [InlineKeyboardButton(text="🌅 Saudação automática", callback_data="cfg_greeting")],  # ← NOVO
         [InlineKeyboardButton(text="🚫 Bloqueios de módulos", callback_data="cfg_module_blocks")],
         [InlineKeyboardButton(text="👤 Bloquear/Desbloquear usuário", callback_data="cfg_user_block")],
         [InlineKeyboardButton(text="📋 Auditoria", callback_data="cfg_audit_log")],
@@ -336,3 +347,269 @@ async def audit_log(callback: CallbackQuery):
         text = "📋 ÚLTIMAS AÇÕES ADMINISTRATIVAS\n\n" + "\n".join(lines)
     await callback.message.answer(text)
     await callback.answer()
+
+
+# ============================================================
+# SAUDAÇÃO AUTOMÁTICA (§1)
+# ============================================================
+
+async def _greeting_view() -> tuple[str, InlineKeyboardMarkup]:
+    s = await get_settings(force=True)
+
+    m_start = getattr(s, "greeting_morning_start", 5)
+    m_end = getattr(s, "greeting_morning_end", 12)
+    a_start = getattr(s, "greeting_afternoon_start", 12)
+    a_end = getattr(s, "greeting_afternoon_end", 18)
+    m_text = getattr(s, "greeting_morning_text", "Bom dia")
+    a_text = getattr(s, "greeting_afternoon_text", "Boa tarde")
+    n_text = getattr(s, "greeting_night_text", "Boa noite")
+
+    text = (
+        "🌅 SAUDAÇÃO AUTOMÁTICA\n\n"
+        "A saudação aparece no menu principal conforme a hora atual.\n"
+        "Configure as faixas horárias e os textos de cada período.\n\n"
+        f"🌅 Manhã: {m_start:02d}h às {m_end:02d}h → <b>{m_text}</b>\n"
+        f"☀️ Tarde: {a_start:02d}h às {a_end:02d}h → <b>{a_text}</b>\n"
+        f"🌙 Noite: restante do dia → <b>{n_text}</b>\n\n"
+        "👇 Toque em um item para editar:"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"🌅 Manhã: {m_start:02d}h–{m_end:02d}h",
+            callback_data="cfg_greet_m_start")],
+        [InlineKeyboardButton(
+            text=f"☀️ Tarde: {a_start:02d}h–{a_end:02d}h",
+            callback_data="cfg_greet_a_start")],
+        [InlineKeyboardButton(
+            text=f"✏️ Texto manhã: {m_text}", callback_data="cfg_greet_m_text")],
+        [InlineKeyboardButton(
+            text=f"✏️ Texto tarde: {a_text}", callback_data="cfg_greet_a_text")],
+        [InlineKeyboardButton(
+            text=f"✏️ Texto noite: {n_text}", callback_data="cfg_greet_n_text")],
+        [InlineKeyboardButton(text="🔄 Restaurar padrão", callback_data="cfg_greet_reset")],
+        [InlineKeyboardButton(text="↩️ Voltar", callback_data="admin_settings")],
+    ])
+    return text, kb
+
+
+@router.callback_query(F.data == "cfg_greeting")
+async def greeting_menu(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+    text, kb = await _greeting_view()
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "cfg_greet_m_start")
+async def greet_m_start(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+    await state.set_state(GreetingStates.waiting_morning_start)
+    await cb.message.answer(
+        "🌅 Envie a hora de <b>início da manhã</b> (0-23):\n"
+        "Ex.: <code>6</code> → manhã começa às 06h"
+    )
+    await cb.answer()
+
+
+@router.message(GreetingStates.waiting_morning_start)
+async def greet_m_start_save(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        v = int(m.text.strip())
+        if not (0 <= v <= 23):
+            raise ValueError
+    except (ValueError, TypeError):
+        await m.answer("❌ Envie um número inteiro de 0 a 23.")
+        return
+    await state.clear()
+
+    async with AsyncSessionLocal() as s:
+        bs = await s.get(BotSettings, 1)
+        current_end = getattr(bs, "greeting_morning_end", 12)
+        if v >= current_end:
+            await m.answer(
+                f"❌ O início da manhã ({v}h) deve ser menor que o fim ({current_end}h)."
+            )
+            return
+        bs.greeting_morning_start = v
+        await s.commit()
+
+    invalidate_cache()
+    await log_admin_action(m.from_user.id, "greeting_morning_start", {"new": v})
+    text, kb = await _greeting_view()
+    await m.answer(f"✅ Manhã inicia às {v:02d}h.", reply_markup=kb)
+
+
+@router.callback_query(F.data == "cfg_greet_a_start")
+async def greet_a_start(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+    await state.set_state(GreetingStates.waiting_afternoon_start)
+    await cb.message.answer(
+        "☀️ Envie a hora de <b>início da tarde</b> (1-23):\n"
+        "Ex.: <code>12</code> → tarde começa ao meio-dia"
+    )
+    await cb.answer()
+
+
+@router.message(GreetingStates.waiting_afternoon_start)
+async def greet_a_start_save(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        v = int(m.text.strip())
+        if not (1 <= v <= 23):
+            raise ValueError
+    except (ValueError, TypeError):
+        await m.answer("❌ Envie um número inteiro de 1 a 23.")
+        return
+    await state.clear()
+
+    async with AsyncSessionLocal() as s:
+        bs = await s.get(BotSettings, 1)
+        current_end = getattr(bs, "greeting_afternoon_end", 18)
+        if v >= current_end:
+            await m.answer(
+                f"❌ O início da tarde ({v}h) deve ser menor que o fim ({current_end}h)."
+            )
+            return
+        bs.greeting_afternoon_start = v
+        await s.commit()
+
+    invalidate_cache()
+    await log_admin_action(m.from_user.id, "greeting_afternoon_start", {"new": v})
+    text, kb = await _greeting_view()
+    await m.answer(f"✅ Tarde inicia às {v:02d}h.", reply_markup=kb)
+
+
+@router.callback_query(F.data == "cfg_greet_m_text")
+async def greet_m_text(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+    await state.set_state(GreetingStates.waiting_morning_text)
+    await cb.message.answer(
+        "✏️ Envie o <b>texto da manhã</b> (2-50 caracteres):\n"
+        "Ex.: <code>Bom dia</code>, <code>Olá</code>, <code>Bom te ver</code>"
+    )
+    await cb.answer()
+
+
+@router.message(GreetingStates.waiting_morning_text)
+async def greet_m_text_save(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    text_v = (m.text or "").strip()
+    if len(text_v) < 2 or len(text_v) > 50:
+        await m.answer("❌ Use 2-50 caracteres.")
+        return
+    await state.clear()
+
+    async with AsyncSessionLocal() as s:
+        bs = await s.get(BotSettings, 1)
+        bs.greeting_morning_text = text_v
+        await s.commit()
+
+    invalidate_cache()
+    await log_admin_action(m.from_user.id, "greeting_morning_text", {"new": text_v})
+    text, kb = await _greeting_view()
+    await m.answer(f"✅ Texto da manhã: <b>{text_v}</b>", reply_markup=kb)
+
+
+@router.callback_query(F.data == "cfg_greet_a_text")
+async def greet_a_text(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+    await state.set_state(GreetingStates.waiting_afternoon_text)
+    await cb.message.answer(
+        "✏️ Envie o <b>texto da tarde</b> (2-50 caracteres):\n"
+        "Ex.: <code>Boa tarde</code>, <code>Olá</code>, <code>Boa tarde!</code>"
+    )
+    await cb.answer()
+
+
+@router.message(GreetingStates.waiting_afternoon_text)
+async def greet_a_text_save(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    text_v = (m.text or "").strip()
+    if len(text_v) < 2 or len(text_v) > 50:
+        await m.answer("❌ Use 2-50 caracteres.")
+        return
+    await state.clear()
+
+    async with AsyncSessionLocal() as s:
+        bs = await s.get(BotSettings, 1)
+        bs.greeting_afternoon_text = text_v
+        await s.commit()
+
+    invalidate_cache()
+    await log_admin_action(m.from_user.id, "greeting_afternoon_text", {"new": text_v})
+    text, kb = await _greeting_view()
+    await m.answer(f"✅ Texto da tarde: <b>{text_v}</b>", reply_markup=kb)
+
+
+@router.callback_query(F.data == "cfg_greet_n_text")
+async def greet_n_text(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+    await state.set_state(GreetingStates.waiting_night_text)
+    await cb.message.answer(
+        "✏️ Envie o <b>texto da noite</b> (2-50 caracteres):\n"
+        "Ex.: <code>Boa noite</code>, <code>Boa madrugada</code>"
+    )
+    await cb.answer()
+
+
+@router.message(GreetingStates.waiting_night_text)
+async def greet_n_text_save(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    text_v = (m.text or "").strip()
+    if len(text_v) < 2 or len(text_v) > 50:
+        await m.answer("❌ Use 2-50 caracteres.")
+        return
+    await state.clear()
+
+    async with AsyncSessionLocal() as s:
+        bs = await s.get(BotSettings, 1)
+        bs.greeting_night_text = text_v
+        await s.commit()
+
+    invalidate_cache()
+    await log_admin_action(m.from_user.id, "greeting_night_text", {"new": text_v})
+    text, kb = await _greeting_view()
+    await m.answer(f"✅ Texto da noite: <b>{text_v}</b>", reply_markup=kb)
+
+
+@router.callback_query(F.data == "cfg_greet_reset")
+async def greet_reset(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("⛔", show_alert=True)
+        return
+
+    async with AsyncSessionLocal() as s:
+        bs = await s.get(BotSettings, 1)
+        bs.greeting_morning_start = 5
+        bs.greeting_morning_end = 12
+        bs.greeting_afternoon_start = 12
+        bs.greeting_afternoon_end = 18
+        bs.greeting_morning_text = "Bom dia"
+        bs.greeting_afternoon_text = "Boa tarde"
+        bs.greeting_night_text = "Boa noite"
+        await s.commit()
+
+    invalidate_cache()
+    await log_admin_action(cb.from_user.id, "greeting_reset", {})
+    text, kb = await _greeting_view()
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer("✅ Saudação restaurada ao padrão.")
